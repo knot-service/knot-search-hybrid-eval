@@ -336,3 +336,45 @@ python phase6_qwen.py phase6-qwen-replay-0 phase6-qwen-replay-1
 ```
 
 `phase6_qwen.py`는 `requirements.txt` 환경에서 실행한다. 각 실행의 로컬 `phase6-citation-audit.json`에 동시 6건 첫 완료 답변의 주장과 인용이 생성된다. 주장별 의미 검수 결과를 같은 경로의 `phase6-semantic-review.json`에 기록하고 다시 집계한다. 게시용 `phase6-qwen-comparison.json`에는 수치만 담는다.
+
+### 6차 후속: 내용 질문과 회의 종합의 생성 Worker 분리
+
+`SEARCH_SPLIT_GENERATION_ROUTES=true`는 생성 슬롯 중 하나를 종합에 배정하고 나머지를 내용 질문에 배정한다. 이 실험은 생성 슬롯 합계 2개와 문서 찾기 슬롯 1개로 두 설정을 비교했다. 옵션 기본값은 `false`다. 분리 설정은 생성 슬롯 2개 이상과 문서 찾기 슬롯 1개 이상이 필요하다. 한쪽 슬롯이 비어 있어도 다른 경로에 빌려주지 않으므로, 요청이 한 경로에 몰릴 때는 해당 경로의 대기가 늘 수 있다.
+
+접수 및 재시도 시 기존 하이브리드 질문 분류 규칙으로 내용 질문의 대기열을 저장한다. 기존 대기 행과 하이브리드 대상 밖의 작업은 종합과 같은 슬롯에서 처리한다. 실행을 시작할 때 저장된 대기열을 잠금 안에서 다시 확인하므로, 스케줄러가 조회한 뒤 재시도로 대기열이 바뀐 작업은 이전 슬롯이 가져가지 않는다. 리랭킹, 문맥 조립, 모델과 출처 검증은 같은 설정을 쓴다.
+
+동시 3·6건 각각 12회, 두 설정마다 예열 6건을 실행한다. 로그의 응답 ID와 Worker 스레드를 대조해 각 경로가 지정 슬롯을 사용했는지 검사한다. Workspace 458은 기대 회의가 검색 문맥에 남았는지와 최종 인용에 모두 포함됐는지를 비교한다. S18-01은 기대 문서가 검색 문맥에 있었지만 최종 인용이 비었던 앞선 사례라 따로 집계한다.
+
+5차 검색 서비스와 기존 `LLM_*`, Docker, `KNOT_PHASE5_INDEX_URL` 환경을 준비한다. 저장소 루트에서 실행한다.
+
+```sh
+root="$PWD"
+local_dir="$root/experiments/hybrid-search/.local"
+cd "$root/backend"
+for split_routes in false true; do
+  run_dir="$local_dir/phase6-generation-routes-$split_routes"
+  mkdir -p -m 700 "$run_dir"
+  cp -p "$local_dir/phase5-fixtures.json" "$run_dir/phase5-fixtures.json"
+  KNOT_PHASE5_FIXTURES="$run_dir/phase5-fixtures.json" KNOT_PHASE6_LOAD=true KNOT_PHASE6_WAVES=12 \
+    SEARCH_LOOKUP_WORKER_CONCURRENCY=1 SEARCH_SPLIT_GENERATION_ROUTES="$split_routes" \
+    ./gradlew integrationTest --rerun --tests '*SearchHybridDatasetReplayTest.measuresMixedConcurrentSse' || exit 1
+  install -m 600 build/test-results/integrationTest/TEST-com.knot.backend.search.application.SearchHybridDatasetReplayTest.xml "$run_dir/worker.xml"
+done
+cd "$root/experiments/hybrid-search"
+python phase6_qwen.py --generation-routes phase6-generation-routes-false phase6-generation-routes-true
+```
+
+Lab에는 집계 결과인 `phase6-generation-comparison.json`만 게시한다.
+
+| 동시 요청 | 경로 | Worker 대기 p95 / p99 (초), 공용 → 분리 | 첫 SSE p95 / p99 (초), 공용 → 분리 | 전체 완료 p95 / p99 (초), 공용 → 분리 |
+| ---: | --- | ---: | ---: | ---: |
+| 3 | 문서 찾기 | 0.103 / 0.103 → 0.105 / 0.105 | 0.269 / 0.269 → 0.400 / 0.400 | 0.269 / 0.269 → 0.400 / 0.400 |
+| 3 | 회의 내용 질문 | 0.103 / 0.103 → 0.104 / 0.104 | 4.786 / 4.786 → 6.925 / 6.925 | 4.786 / 4.786 → 7.032 / 7.032 |
+| 3 | 여러 회의 종합 | 0.117 / 0.117 → 0.097 / 0.097 | 7.741 / 7.741 → 8.116 / 8.116 | 7.741 / 7.741 → 8.116 / 8.116 |
+| 6 | 문서 찾기 | 0.208 / 0.224 → 0.270 / 0.328 | 0.354 / 0.357 → 0.450 / 0.466 | 0.355 / 0.357 → 0.451 / 0.466 |
+| 6 | 회의 내용 질문 | 5.257 / 5.301 → 4.895 / 5.164 | 8.975 / 9.085 → 7.772 / 7.973 | 8.975 / 9.085 → 7.773 / 8.082 |
+| 6 | 여러 회의 종합 | 3.668 / 3.844 → 5.988 / 6.057 | 8.100 / 8.246 → 10.074 / 10.514 | 8.100 / 8.246 → 10.075 / 10.515 |
+
+두 설정 각각 108/108건이 완료됐으며, Worker 로그에서도 108/108건이 지정 슬롯과 일치했다. 문서 찾기 36건씩의 생성·분류 호출은 모두 0회였다. 동시 6건에서 내용 질문의 대기와 첫 SSE가 짧아졌고 종합은 대기와 첫 SSE가 길어졌다. 동시 3건에서는 내용 질문 Worker 대기가 비슷했지만 첫 SSE와 완료 시간이 늘었다. 단계별 백분위는 서로 다른 요청에서 나올 수 있다. 경로별 표본 12·24건에서 p99는 관측 최댓값이다.
+
+Workspace 458의 동일한 생성 요청 36쌍에서 기대 회의가 검색 문맥에서 줄어든 사례는 없었다. 기대 회의를 모두 인용한 답변은 31/36 → 36/36건이었다. S18-01은 양쪽 모두 6/6건에서 기대 문서를 문맥에 넣었고, 최종 인용은 1/6 → 6/6건, 인용이 전혀 없던 답변은 5/6 → 0/6건이었다. 표시 인용은 50/50 → 62/62개가 원문과 저장 출처에 일치했다. 초기 분리 재실행에서는 S18-01이 6/6건 인용했지만 S71-01에서 누락이 있었다. 두 설정에서 모델·프롬프트와 인용 검증이 동일하므로 최종 인용 차이를 슬롯 분리의 효과로 단정할 수 없다.

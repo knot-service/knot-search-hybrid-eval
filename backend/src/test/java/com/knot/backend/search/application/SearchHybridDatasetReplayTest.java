@@ -374,6 +374,8 @@ class SearchHybridDatasetReplayTest {
                     .list();
             boolean lookupOnly = jdbc.sql("SELECT lookup_only FROM search_answer_executions WHERE answer_id = :id")
                     .param("id", event.answerId()).query(Boolean.class).optional().orElse(false);
+            boolean questionOnly = jdbc.sql("SELECT question_only FROM search_answer_executions WHERE answer_id = :id")
+                    .param("id", event.answerId()).query(Boolean.class).optional().orElse(false);
             results.add(
                     new LoadObservation(
                             sample.concurrency(),
@@ -386,6 +388,7 @@ class SearchHybridDatasetReplayTest {
                             event.httpStatus(),
                             event.terminal(),
                             lookupOnly,
+                            questionOnly,
                             generations.getOrDefault(
                                     event.answerId(),
                                     0
@@ -419,6 +422,7 @@ class SearchHybridDatasetReplayTest {
                                 waves,
                                 workerProperties.getConcurrency(),
                                 workerProperties.getLookupConcurrency(),
+                                workerProperties.isSplitGenerationRoutes(),
                                 workerProperties.getStreamConcurrency(),
                                 workerProperties.getPollInterval()
                                         .toMillis(),
@@ -431,6 +435,12 @@ class SearchHybridDatasetReplayTest {
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING
         );
         assertThat(results).hasSize(9 * waves);
+        assertThat(results).allSatisfy(row -> {
+            assertThat(row.questionOnly()).isEqualTo(workerProperties.isSplitGenerationRoutes()
+                    && row.expectedRoute() == Route.MEETING_QUESTION);
+            assertThat(row.actualRoute()).isEqualTo(row.expectedRoute());
+            assertThat(row.terminal()).isEqualTo("completed");
+        });
         assertThat(results).allSatisfy(row -> assertThat(row.lookupOnly())
                 .isEqualTo(workerProperties.getLookupConcurrency() > 0 && row.expectedRoute() == Route.DOCUMENT_FIND));
         assertThat(
@@ -521,6 +531,7 @@ class SearchHybridDatasetReplayTest {
             int httpStatus,
             String terminal,
             boolean lookupOnly,
+            boolean questionOnly,
             int generationCalls,
             int classificationCalls,
             List<Long> expectedIds,
@@ -537,6 +548,7 @@ class SearchHybridDatasetReplayTest {
             int wavesPerLevel,
             int workerConcurrency,
             int lookupConcurrency,
+            boolean splitGenerationRoutes,
             int streamConcurrency,
             long pollIntervalMs,
             List<LoadObservation> requests

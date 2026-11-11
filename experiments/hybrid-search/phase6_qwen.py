@@ -8,10 +8,12 @@ import re
 
 from database import LOCAL
 from phase5_eval import FIND, QUESTION, read, write
-from phase6_eval import ROUTES, hit_meetings, sample_key, summarize
+from phase6_eval import ROUTES, expected_meetings, hit_meetings, sample_key, summarize
 
 
 QUEUE = re.compile(r"phase=queue_wait workspaceId=(\d+) answerId=(\d+) elapsedMs=(\d+)")
+WORKER = re.compile(r"\[([^\[\]\n]*(?:lookup|generation|question|synthesis)-\d+)\][^\n]*"
+                    r"phase=queue_wait workspaceId=(\d+) answerId=(\d+)")
 SEARCH = re.compile(
     r"Hybrid search workspaceId=(\d+) answerId=(\d+) route=(\w+) questionMs=\d+ "
     r"retrievalMs=(\d+) rerankMs=(\S+)"
@@ -117,7 +119,50 @@ def run_summary(directory: Path, load: dict, context_regressions: Counter) -> di
     }
 
 
-def compare(shared_dir: Path, split_dir: Path) -> None:
+def verify_workers(directory: Path, load: dict, split: bool) -> int:
+    log = (LOCAL / directory / "worker.xml").read_text()
+    workers = {(int(workspace), int(answer)): thread for thread, workspace, answer in WORKER.findall(log)}
+    generation_threads = set()
+    matched = 0
+    for row in load["requests"]:
+        thread = workers[row["workspaceId"], row["answerId"]]
+        if row["expectedRoute"] == FIND:
+            expected = ("lookup-1",)
+        elif split:
+            expected = ("question-1",) if row["expectedRoute"] == QUESTION else ("synthesis-1",)
+        else:
+            expected = ("generation-1", "generation-2")
+        if not thread.endswith(expected):
+            raise ValueError(f"Unexpected Worker for {row['expectedRoute']}: {thread}")
+        matched += 1
+        if row["expectedRoute"] != FIND:
+            generation_threads.add(thread)
+    if len(generation_threads) != load["workerConcurrency"]:
+        raise ValueError(f"Unexpected number of generation Workers: {len(generation_threads)}")
+    return matched
+
+
+def citation_coverage(rows: list[dict], meetings: dict) -> dict:
+    generated = [row for row in rows if row["expectedRoute"] != FIND and row["terminal"] == "completed"]
+    missing = Counter()
+    for row in generated:
+        workspace_meetings = meetings[row["workspaceId"]]
+        if expected_meetings(row, workspace_meetings) != hit_meetings(row, workspace_meetings, "citedIds"):
+            missing[row["caseId"]] += 1
+    tracked = [row for row in generated if row["caseId"] == "S18-01"]
+    return {
+        "generated": len(generated), "allExpectedMeetingsCited": len(generated) - sum(missing.values()),
+        "missingCases": [{"caseId": case_id, "requests": count} for case_id, count in sorted(missing.items())],
+        "trackedCase": {
+            "requests": len(tracked),
+            "allExpectedDocumentsInContext": sum(set(row["expectedIds"]) <= set(row["candidateIds"]) for row in tracked),
+            "allExpectedDocumentsCited": sum(set(row["expectedIds"]) <= set(row["citedIds"]) for row in tracked),
+            "noCitations": sum(not row["citedIds"] for row in tracked),
+        },
+    }
+
+
+def compare(shared_dir: Path, split_dir: Path, *, generation_routes: bool = False) -> None:
     before = read(str(shared_dir / "phase6-spring-load-report.json"))
     after = read(str(split_dir / "phase6-spring-load-report.json"))
     before_rows = {sample_key(row): row for row in before["requests"]}
@@ -125,7 +170,11 @@ def compare(shared_dir: Path, split_dir: Path) -> None:
     for field in ("workerConcurrency", "streamConcurrency", "pollIntervalMs", "warmupRequests", "wavesPerLevel"):
         if before[field] != after[field]:
             raise ValueError(f"Replay settings differ for {field}.")
-    if before["lookupConcurrency"] != 0 or after["lookupConcurrency"] < 1:
+    if generation_routes:
+        if (before["lookupConcurrency"] != 1 or after["lookupConcurrency"] != 1
+                or before["workerConcurrency"] != 2 or before["splitGenerationRoutes"] or not after["splitGenerationRoutes"]):
+            raise ValueError("Generation comparison requires one lookup Worker and two generation Workers in both runs.")
+    elif before["lookupConcurrency"] != 0 or after["lookupConcurrency"] < 1:
         raise ValueError("The first run must share Workers and the second must isolate document lookup.")
     if len(before_rows) != len(before["requests"]) or len(after_rows) != len(after["requests"]) or before_rows.keys() != after_rows.keys():
         raise ValueError("Replays must contain exactly one of each request in the same cohort.")
@@ -153,12 +202,20 @@ def compare(shared_dir: Path, split_dir: Path) -> None:
         "contextComparisons": [{"workspaceId": workspace, "requests": count}
                                for workspace, count in sorted(comparisons.items())],
     }
-    print(write(str(split_dir / "phase6-qwen-comparison.json"), result))
+    if generation_routes:
+        for key, directory, load in (("shared", shared_dir, before), ("split", split_dir, after)):
+            result[key]["workerMatches"] = verify_workers(directory, load, key == "split")
+            for workspace in result[key]["quality"]:
+                rows = [row for row in load["requests"] if row["workspaceId"] == workspace["workspaceId"]]
+                workspace.update(citation_coverage(rows, meetings))
+    name = "phase6-generation-comparison.json" if generation_routes else "phase6-qwen-comparison.json"
+    print(write(str(split_dir / name), result))
 
 
 if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("shared", type=Path, help="Shared-Worker run directory under .local")
     parser.add_argument("split", type=Path, help="Split-Worker run directory under .local")
+    parser.add_argument("--generation-routes", action="store_true", help="Compare shared and split generation Workers")
     args = parser.parse_args()
-    compare(args.shared, args.split)
+    compare(args.shared, args.split, generation_routes=args.generation_routes)
