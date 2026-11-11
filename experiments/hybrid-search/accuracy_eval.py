@@ -97,7 +97,7 @@ class Replay:
                             for name, hits in (("search", keyword + vector), ("fusion", candidates),
                                                ("selection", selected))
                         }
-                    passages = [p.model_dump() for p in result.passages]
+                    passages = [p.model_dump() for p in (*result.passages, *result.supportingPassages)]
                     sizes["rerankCandidates"].append(len(candidates))
                 elif row["retrievalNanos"]:
                     raise ValueError(f"Missing captured scope for {case['id']}")
@@ -239,9 +239,47 @@ def compare_representatives(replay, root, stage):
     }, indent=2) + "\n")
 
 
+def compare_supporting_documents(replay, root):
+    original = read(root / "overlap-reuse/supplement-overlap.json")["misses"]
+    expanded = next(t for t in read(root / "meeting-representatives-refine.json")["trials"]
+                    if t["name"] == "본문 1 · 검색어 24 · RRF 1 · 범위 확장 3072")
+    recovered = set(map(tuple, expanded["gained"]["1"]))
+    recovered.update(map(tuple, read(root / "overlap-reuse/supplement-overlap.json")["trials"][0]["gained"]["1"]))
+    target = {(m["case"], m["document"], m["field"], m["start"], m["end"])
+              for m in original if m["reason"] == "same_meeting_other_document"} - recovered
+    assert len(target) == 85
+    baseline, before = replay.run(SPARE_SLOT_SETTINGS, "dates")
+    assert baseline[1]["matched"] == 378 and not (target & before[1])
+    print("control", baseline, flush=True)
+    trials = []
+    for length, reserve, lexical, questions in (
+        (96, 0, 0.0, False), (160, 0, 0.0, False), (220, 0, 0.0, False),
+        (160, 160, 0.0, False), (220, 320, 0.0, False),
+        (160, 0, 8.0, False), (220, 0, 8.0, False),
+        (220, 0, 24.0, False), (220, 0, 8.0, True),
+    ):
+        config = SPARE_SLOT_SETTINGS.model_copy(update={
+            "supporting_excerpt_tokens": length, "supporting_reserve_tokens": reserve,
+            "supporting_lexical_bonus": lexical, "supporting_in_questions": questions,
+        })
+        stats, after = replay.run(config, "dates")
+        delta = compare(before, after)
+        result = {"settings": config.model_dump(), "stats": stats, "delta": delta,
+                  "targetRecovered": len(after[1] & target), **changed_spans(before, after)}
+        trials.append(result)
+        print((length, reserve, lexical, questions), stats[1]["matched"], delta, result["targetRecovered"],
+              stats[1]["meetings"], stats[458]["meetings"], stats[458]["matched"], flush=True)
+    (root / "supporting-documents.json").write_text(json.dumps({
+        "baseline": baseline, "target": sorted(target), "trials": trials,
+    }, indent=2) + "\n")
+
+
 async def run(root, stage):
     async with lifespan(app):
         replay = Replay(root, app.state)
+        if stage == "supporting-documents":
+            compare_supporting_documents(replay, root)
+            return
         if stage.startswith("meeting-representatives"):
             compare_representatives(replay, root, stage)
             return
@@ -334,7 +372,7 @@ if __name__ == "__main__":
     parser.add_argument("root", type=Path)
     parser.add_argument("stage", choices=(
         "selection", "remaining", "followup", "supplement-overlap",
-        "meeting-representatives", "meeting-representatives-rrf", "meeting-representatives-refine",
+        "meeting-representatives", "meeting-representatives-rrf", "meeting-representatives-refine", "supporting-documents",
     ))
     args = parser.parse_args()
     asyncio.run(run(args.root, args.stage))
