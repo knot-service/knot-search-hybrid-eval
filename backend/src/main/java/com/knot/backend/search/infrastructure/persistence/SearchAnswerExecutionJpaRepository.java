@@ -41,6 +41,15 @@ interface SearchAnswerExecutionJpaRepository extends JpaRepository<SearchAnswerE
     List<SearchGenerationCandidate> findQueuedGenerationByPriority(Pageable pageable);
 
     @Query("""
+            select new com.knot.backend.search.domain.repository.SearchGenerationCandidate(e.answerId, e.questionOnly,
+                case when e.synthesisQueuedAt <= :cutoff then true else false end)
+            from SearchAnswerExecution e where e.state = 'QUEUED' and e.lookupOnly = false
+            order by case when e.synthesisQueuedAt <= :cutoff then 0 when e.questionOnly = true then 1 else 2 end,
+                case when e.synthesisQueuedAt <= :cutoff then e.synthesisQueuedAt else e.createdAt end, e.answerId
+            """)
+    List<SearchGenerationCandidate> findQueuedGenerationWithOverdueSynthesis(Instant cutoff, Pageable pageable);
+
+    @Query("""
             select e.answerId from SearchAnswerExecution e
             where e.state = 'RUNNING' and e.deadlineAt <= :now order by e.deadlineAt, e.answerId
             """)

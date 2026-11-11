@@ -98,9 +98,16 @@ public class SearchAnswerScheduler {
     }
 
     private void dispatchByPriority(int limit) {
-        for (var candidate : repository.findQueuedGenerationByPriority(limit)) {
+        var promotionWait = properties.getSynthesisPromotionWait();
+        var candidates = promotionWait.isZero()
+                ? repository.findQueuedGenerationByPriority(limit)
+                : repository.findQueuedGenerationWithOverdueSynthesis(clock.instant().minus(promotionWait), limit);
+        for (var candidate : candidates) {
             if (!submit(executor, candidate.answerId(), candidate.lane())) {
                 return;
+            }
+            if (candidate.overdueSynthesis()) {
+                log.info("Search dispatch phase=synthesis_promoted answerId={}", candidate.answerId());
             }
         }
     }

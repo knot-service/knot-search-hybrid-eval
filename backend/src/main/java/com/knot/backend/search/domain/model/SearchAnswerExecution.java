@@ -54,6 +54,9 @@ public class SearchAnswerExecution {
     @Column(name = "question_only", nullable = false)
     private boolean questionOnly;
 
+    @Column(name = "synthesis_queued_at")
+    private Instant synthesisQueuedAt;
+
     protected SearchAnswerExecution() {}
 
     public static SearchAnswerExecution queue(
@@ -84,7 +87,7 @@ public class SearchAnswerExecution {
         execution.answerId = answerId;
         execution.state = SearchExecutionState.QUEUED;
         execution.createdAt = createdAt;
-        execution.assignLane(lane);
+        execution.assignLane(lane, createdAt);
         return execution;
     }
 
@@ -133,7 +136,7 @@ public class SearchAnswerExecution {
     }
 
     public void retry() {
-        retry(lane());
+        retry(synthesisQueuedAt == null ? lane() : SearchExecutionLane.SYNTHESIS, createdAt);
     }
 
     public SearchExecutionLane lane() {
@@ -143,7 +146,7 @@ public class SearchAnswerExecution {
         return questionOnly ? SearchExecutionLane.QUESTION : SearchExecutionLane.DEFAULT;
     }
 
-    public void retry(SearchExecutionLane lane) {
+    public void retry(SearchExecutionLane lane, Instant queuedAt) {
         if (state != SearchExecutionState.FINISHED) {
             throw new SearchException(SearchErrorCode.INVALID_SEARCH_STATE);
         }
@@ -151,13 +154,14 @@ public class SearchAnswerExecution {
         deadlineAt = null;
         stage = null;
         excludedCount = null;
-        assignLane(lane);
+        assignLane(lane, queuedAt);
         state = SearchExecutionState.QUEUED;
     }
 
-    private void assignLane(SearchExecutionLane lane) {
+    private void assignLane(SearchExecutionLane lane, Instant queuedAt) {
         lookupOnly = lane == SearchExecutionLane.LOOKUP;
         questionOnly = lane == SearchExecutionLane.QUESTION;
+        synthesisQueuedAt = lane == SearchExecutionLane.SYNTHESIS ? queuedAt : null;
     }
 
     public void finish() {

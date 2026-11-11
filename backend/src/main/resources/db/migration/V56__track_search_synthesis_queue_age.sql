@@ -1,0 +1,1 @@
+ALTER TABLE search_answer_executions ADD COLUMN synthesis_queued_at TIMESTAMPTZ;

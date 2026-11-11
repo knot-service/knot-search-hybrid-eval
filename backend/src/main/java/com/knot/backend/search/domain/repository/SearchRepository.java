@@ -73,6 +73,8 @@ public interface SearchRepository {
 
     List<SearchGenerationCandidate> findQueuedGenerationByPriority(int limit);
 
+    List<SearchGenerationCandidate> findQueuedGenerationWithOverdueSynthesis(Instant cutoff, int limit);
+
     List<Long> findExpiredAnswerIds(
             Instant now,
             int limit

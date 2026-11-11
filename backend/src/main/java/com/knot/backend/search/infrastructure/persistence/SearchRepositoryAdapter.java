@@ -166,6 +166,11 @@ public class SearchRepositoryAdapter implements SearchRepository {
         return executions.findQueuedGenerationByPriority(PageRequest.of(0, limit));
     }
 
+    @Override
+    public List<SearchGenerationCandidate> findQueuedGenerationWithOverdueSynthesis(Instant cutoff, int limit) {
+        return executions.findQueuedGenerationWithOverdueSynthesis(cutoff, PageRequest.of(0, limit));
+    }
+
     public List<Long> findExpiredAnswerIds(
             Instant now,
             int limit

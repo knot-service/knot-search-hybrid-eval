@@ -87,7 +87,8 @@ public class SearchAnswerRetryService {
                 questionId
         );
         answer.retry();
-        execution.retry(workerLane.classify(workspaceId, question.getContent()));
+        var queuedAt = clock.instant();
+        execution.retry(workerLane.classify(workspaceId, question.getContent()), queuedAt);
         repository.deleteEvidences(answer.getId());
         SearchRequestReceipt receipt = repository.save(
                 SearchRequestReceipt.retry(
@@ -97,7 +98,7 @@ public class SearchAnswerRetryService {
                         conversationId,
                         questionId,
                         answer.getId(),
-                        clock.instant()
+                        queuedAt
                 )
         );
         conversation.recordMessageActivity(receipt.getCreatedAt());

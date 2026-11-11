@@ -208,6 +208,20 @@ class SearchAnswerRetryIntegrationTest {
     }
 
     @Test
+    void synthesisRetryStartsANewPromotionWait() {
+        when(workerLane.classify(workspace, old.question())).thenReturn(SearchExecutionLane.SYNTHESIS);
+        jdbc.sql("UPDATE search_answer_executions SET synthesis_queued_at = TIMESTAMPTZ '2000-01-01 00:00:00Z' WHERE answer_id = :id")
+                .param("id", old.answerId()).update();
+
+        retry(UUID.randomUUID());
+
+        var candidate = repository.findQueuedGenerationWithOverdueSynthesis(
+                java.time.Instant.parse("2001-01-01T00:00:00Z"), 1).getFirst();
+        assertThat(candidate.answerId()).isEqualTo(old.answerId());
+        assertThat(candidate.overdueSynthesis()).isFalse();
+    }
+
+    @Test
     @DisplayName("재시도는 기존 메시지·순서를 유지하고 오류·진행 상태를 교체한다")
     void acceptRetry_success_atomicReset() {
         // when

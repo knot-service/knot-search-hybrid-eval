@@ -127,6 +127,27 @@ class SearchAnswerExecutionIntegrationTest {
     }
 
     @Test
+    void generationQueuePromotesOnlyOverdueSynthesis() {
+        long question = intake.acceptFirst(workspaceId, memberId,
+                new SearchQuestionCommand("내용 질문", UUID.randomUUID())).answerMessageId();
+        long recentSynthesis = intake.acceptFirst(workspaceId, memberId,
+                new SearchQuestionCommand("최근 종합", UUID.randomUUID())).answerMessageId();
+        jdbc.sql("UPDATE search_answer_executions SET question_only = true WHERE answer_id = :id")
+                .param("id", question).update();
+        jdbc.sql("UPDATE search_answer_executions SET synthesis_queued_at = :queued WHERE answer_id = :id")
+                .param("queued", java.time.OffsetDateTime.ofInstant(NOW.minusSeconds(3), java.time.ZoneOffset.UTC))
+                .param("id", accepted.answerMessageId()).update();
+        jdbc.sql("UPDATE search_answer_executions SET synthesis_queued_at = :queued WHERE answer_id = :id")
+                .param("queued", java.time.OffsetDateTime.ofInstant(NOW.minusSeconds(1), java.time.ZoneOffset.UTC))
+                .param("id", recentSynthesis).update();
+
+        assertThat(repository.findQueuedGenerationWithOverdueSynthesis(NOW.minusSeconds(2), 3)).containsExactly(
+                new SearchGenerationCandidate(accepted.answerMessageId(), false, true),
+                new SearchGenerationCandidate(question, true),
+                new SearchGenerationCandidate(recentSynthesis, false));
+    }
+
+    @Test
     @DisplayName("두 worker가 같은 작업을 선점하면 한 실행만 얻는다")
     void claim_success_concurrent() throws Exception {
         CyclicBarrier start = new CyclicBarrier(2);

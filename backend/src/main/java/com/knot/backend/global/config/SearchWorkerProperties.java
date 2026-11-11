@@ -17,6 +17,7 @@ public class SearchWorkerProperties {
     private int lookupConcurrency;
     private boolean splitGenerationRoutes;
     private boolean shareGenerationSlots;
+    private Duration synthesisPromotionWait = Duration.ZERO;
     private int candidateLimit = 20;
     private Duration pollInterval = Duration.ofSeconds(1);
     private Duration executionLease = Duration.ofSeconds(150);
@@ -27,6 +28,10 @@ public class SearchWorkerProperties {
 
     public void validate() {
         validateConcurrency();
+        if (synthesisPromotionWait == null || synthesisPromotionWait.isNegative()
+                || (!synthesisPromotionWait.isZero() && !shareGenerationSlots)) {
+            throw new SearchException(SearchErrorCode.INVALID_SEARCH_CONFIGURATION);
+        }
         validateCandidateLimit();
         validateStreamConcurrency();
         validateDuration(pollInterval);

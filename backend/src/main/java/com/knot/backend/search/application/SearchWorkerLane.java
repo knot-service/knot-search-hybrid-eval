@@ -25,7 +25,8 @@ class SearchWorkerLane {
             case DOCUMENT_FIND -> SearchExecutionLane.LOOKUP;
             case MEETING_QUESTION -> workerProperties.isSplitGenerationRoutes()
                     ? SearchExecutionLane.QUESTION : SearchExecutionLane.DEFAULT;
-            case MULTI_MEETING_SYNTHESIS -> SearchExecutionLane.DEFAULT;
+            case MULTI_MEETING_SYNTHESIS -> workerProperties.isSplitGenerationRoutes()
+                    ? SearchExecutionLane.SYNTHESIS : SearchExecutionLane.DEFAULT;
         };
     }
 }
