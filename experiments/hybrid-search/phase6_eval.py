@@ -72,7 +72,7 @@ def sample_key(row: dict) -> tuple[int, int, int, str]:
     return row["concurrency"], row["wave"], row["workspaceId"], row["caseId"]
 
 
-def summarize(log_path: Path | None = None, run_dir: Path = Path(".")) -> None:
+def summarize(log_path: Path | None = None, run_dir: Path = Path("."), *, compare_shared: bool = True) -> dict:
     fixture = read("phase5-fixtures.json")
     baseline = read("phase5-spring-report.json")
     baseline_replay = {row["caseId"]: row for row in baseline["replay"]}
@@ -80,7 +80,7 @@ def summarize(log_path: Path | None = None, run_dir: Path = Path(".")) -> None:
     load = read(str(run_dir / "phase6-spring-load-report.json"))
     rows = load["requests"]
     shared = {}
-    if run_dir != Path("."):
+    if compare_shared and run_dir != Path("."):
         shared = {sample_key(row): row for row in read("phase6-spring-load-report.json")["requests"]}
         assert len(shared) == len(rows) and shared.keys() == {sample_key(row) for row in rows}
     levels = sorted({row["concurrency"] for row in rows})
@@ -192,7 +192,7 @@ def summarize(log_path: Path | None = None, run_dir: Path = Path(".")) -> None:
         worker_timings(log_path, summary)
     write(str(run_dir / "phase6-citation-audit.json"), {"cases": audit})
     write(str(run_dir / "phase6-summary.json"), summary)
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return summary
 
 
 if __name__ == "__main__":
@@ -200,4 +200,4 @@ if __name__ == "__main__":
     parser.add_argument("worker_log", nargs="?", type=Path)
     parser.add_argument("--run-dir", default=Path("."), type=Path, help="Run subdirectory under .local")
     args = parser.parse_args()
-    summarize(args.worker_log, args.run_dir)
+    print(json.dumps(summarize(args.worker_log, args.run_dir), ensure_ascii=False, indent=2))

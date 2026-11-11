@@ -293,3 +293,46 @@ cd ../experiments/hybrid-search
 ```
 
 분리 전의 `.local/phase6-spring-load-report.json`을 보존해야 같은 사례끼리 검색 문맥을 비교할 수 있다. 답변 원문은 로컬 보고서에만 보관하고 Lab에는 집계만 게시한다.
+
+### 6차 후속: 내용 질문 지연 구간 재실측
+
+동일 커밋에서 문서 찾기 슬롯만 0과 1로 바꿔 각각 예열 6건과 동시 3·6건 12회씩을 실행했다. 두 실행에서 같은 동시성·회차·워크스페이스·사례를 대조한다. 평가 로그는 응답 ID로 Worker 접수 대기, 검색 전체, 검색에 포함된 리랭킹, Qwen 스트림을 결합한다. Qwen 첫 내용 대기는 Spring의 HTTP 요청 시작부터 첫 모델 내용까지로, 네트워크·모델 서버 대기·입력 처리 시간이 포함된다. 이후 생성은 첫 내용부터 Qwen 스트림 종료까지다. 서버 내부 큐를 개별 요청으로 분리할 지표는 이 엔드포인트에서 제공받지 못했다.
+
+Spring은 구조화된 모델 응답 전체를 받은 뒤 출처를 검증하고 첫 사용자 답변을 SSE로 전송한다. 첫 SSE에는 첫 내용 대기와 이후 생성이 모두 들어간다. 구간별 p95는 서로 다른 요청에서 나올 수 있으므로 각 값을 더하지 않는다. Lab에는 첫 SSE p95·p99에 해당하는 실제 요청의 구간도 따로 표시한다.
+
+| 내용 질문 구간 | 동시 3건 p95 / p99 (초), 공용 → 분리 | 동시 6건 p95 / p99 (초), 공용 → 분리 |
+| --- | ---: | ---: |
+| 첫 SSE | 4.357 / 4.357 → 5.003 / 5.003 | 8.601 / 8.655 → 8.093 / 8.478 |
+| 전체 완료 | 4.357 / 4.357 → 5.004 / 5.004 | 8.601 / 8.655 → 8.093 / 8.478 |
+| Worker 대기 | 0.103 / 0.103 → 0.107 / 0.107 | 5.199 / 6.218 → 4.949 / 5.701 |
+| 검색 전체 | 0.899 / 0.899 → 0.635 / 0.635 | 0.727 / 0.856 → 0.782 / 0.809 |
+| 리랭킹 | 0.806 / 0.806 → 0.547 / 0.547 | 0.681 / 0.805 → 0.730 / 0.772 |
+| Qwen 첫 내용 대기 | 2.410 / 2.410 → 2.383 / 2.383 | 2.026 / 2.594 → 2.118 / 2.269 |
+| Qwen 이후 생성 | 2.096 / 2.096 → 2.222 / 2.222 | 1.980 / 2.298 → 2.177 / 2.217 |
+
+동시 3건에서 첫 SSE가 가장 느린 각 요청의 Qwen 첫 내용 대기는 1.422 → 2.383초였다. 이 두 요청의 Worker 대기는 0.103 → 0.060초, 리랭킹은 0.594 → 0.482초, 이후 생성은 2.096 → 1.884초였다. 가장 느린 요청에서 Qwen의 첫 내용을 기다리는 시간이 늘어 전체 지연 증가분을 설명한다. 이 비교는 각 실행에서 순위가 같은 관측값을 보여준다. 구간별 Qwen 첫 내용 대기 p95는 2.410 → 2.383초로, 전체 표본의 첫 내용 대기 악화는 관찰되지 않았다.
+
+동시 6건에서 이전 6차의 내용 질문 지연 증가(7.405 → 9.125초)는 재현되지 않았다. 이번 첫 SSE p95 요청의 가장 긴 구간은 Worker 대기였으며 공용 5.199초, 분리 5.701초였다. 이 두 요청의 Qwen 스트림 전체는 2.767 → 1.977초였다. Worker 대기만 별도로 집계한 p95는 5.199 → 4.949초였다. 반복마다 각 경로의 대기와 생성 시간이 달라지므로 한 번의 전후 차이로 Worker 분리의 인과 효과를 단정할 수 없다.
+
+두 설정에서 각각 108건이 완료됐고 문서 찾기 36건씩의 생성·분류 모델 호출은 모두 0회였다. 문서 찾기 첫 SSE p95는 동시 3건에서 3.035 → 0.260초, 동시 6건에서 6.503 → 0.364초였다. 생성 요청 72쌍에서 기대 회의가 검색 문맥에서 줄어든 사례는 0건이었다. 표시 인용의 원문·저장 출처 일치는 198/198 → 174/174개였고, 근거 부족 안내로 끝난 답변은 7/72 → 9/72건이었다. 같은 동시 6건 질문 10개의 첫 완료 답변에서 주장 전체를 지지한 인용은 18/20 → 11/13개였다. 분리 후 두 답변은 주장을 표시하지 않아 의미 검수 분모에서 빠졌다. 기대 회의를 모두 인용한 종합은 Workspace 1에서 2/3 → 2/3건, Workspace 458에서 3/3 → 2/3건이었다. 이 표본에는 기대 문서가 문맥에 남아 있었지만 최종 인용이 비어 있던 답변이 포함됐다.
+
+5차 검색 서비스를 켜고 동일한 `LLM_*`, Docker 환경과 `KNOT_PHASE5_INDEX_URL`을 설정한 뒤 저장소 루트에서 실행한다.
+
+```sh
+root="$PWD"
+local_dir="$root/experiments/hybrid-search/.local"
+cd "$root/backend"
+for lookup_slots in 0 1; do
+  run_dir="$local_dir/phase6-qwen-replay-$lookup_slots"
+  mkdir -p -m 700 "$run_dir"
+  cp -p "$local_dir/phase5-fixtures.json" "$run_dir/phase5-fixtures.json"
+  KNOT_PHASE5_FIXTURES="$run_dir/phase5-fixtures.json" KNOT_PHASE6_LOAD=true KNOT_PHASE6_WAVES=12 \
+    SEARCH_LOOKUP_WORKER_CONCURRENCY="$lookup_slots" \
+    ./gradlew integrationTest --rerun --tests '*SearchHybridDatasetReplayTest.measuresMixedConcurrentSse' || exit 1
+  install -m 600 build/test-results/integrationTest/TEST-com.knot.backend.search.application.SearchHybridDatasetReplayTest.xml "$run_dir/worker.xml"
+done
+cd "$root/experiments/hybrid-search"
+python phase6_qwen.py phase6-qwen-replay-0 phase6-qwen-replay-1
+```
+
+`phase6_qwen.py`는 `requirements.txt` 환경에서 실행한다. 각 실행의 로컬 `phase6-citation-audit.json`에 동시 6건 첫 완료 답변의 주장과 인용이 생성된다. 주장별 의미 검수 결과를 같은 경로의 `phase6-semantic-review.json`에 기록하고 다시 집계한다. 게시용 `phase6-qwen-comparison.json`에는 수치만 담는다.
