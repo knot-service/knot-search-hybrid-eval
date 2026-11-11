@@ -18,7 +18,11 @@ from database import connect, vector_literal
 from experiment import MODEL, REVISION, tokens
 from phase1 import Hit, chunks, prepare
 from phase2 import DEPTH, fuse, ms
-from phase3 import CONTEXT_COUNT, RERANKER, RERANKER_REVISION, assemble, material
+from phase3 import CONTEXT_COUNT, RERANKER, RERANKER_REVISION, assemble_worker_context, material
+
+BODY_SCORE_MARGIN = 1.0
+WEAK_SCORE_GAP = 6.25
+WEAK_PASSAGE_TOKENS = 96
 
 
 class RankRequest(Frozen):
@@ -91,16 +95,20 @@ class Retriever:
         started = perf_counter()
         with rerank_lock:
             scores = reranker.predict(pairs, batch_size=10, show_progress_bar=False)
-        ranked = tuple(hit for hit, _ in sorted(zip(candidates, scores, strict=True),
-                                                key=lambda entry: -float(entry[1])))
+        relevance = dict(zip(candidates, map(float, scores), strict=True))
+        ranked = tuple(sorted(candidates, key=lambda hit: -relevance[hit]))
         rerank_ms = ms(started)
         started = perf_counter()
         if request.contextMode == "synthesis":
             selected = self.by_meeting(ranked, request.recentMeetings)
         else:
             selected = self.by_document(ranked)
+        selected = prefer_source_text(selected, ranked, relevance)
+        best = relevance[ranked[0]]
+        limits = {hit: WEAK_PASSAGE_TOKENS for hit in selected
+                  if best >= 0 and best - relevance[hit] > WEAK_SCORE_GAP}
         with tokenizer_lock:
-            contexts = assemble(selected, self.source, self.tokenizer, expand=True, balanced=True)
+            contexts = assemble_worker_context(selected, self.source, self.tokenizer, limits)
         passages = tuple(Passage(**item.hit.model_dump(), tokenCount=item.tokenCount,
                                  quote=material(self.source[item.hit.documentId], item.hit)[item.hit.start:item.hit.end])
                          for item in contexts)
@@ -129,6 +137,25 @@ class Retriever:
             meetings.sort(key=recorded, reverse=True)
             meetings = meetings[:recent]
         return tuple(meetings[:CONTEXT_COUNT])
+
+
+def prefer_source_text(selected: tuple[Hit, ...], ranked: tuple[Hit, ...],
+                       scores: dict[Hit, float]) -> tuple[Hit, ...]:
+    body_by_document: dict[int, Hit] = {}
+    for hit in ranked:
+        if hit.field == "body":
+            body_by_document.setdefault(hit.documentId, hit)
+    passages = []
+    used = set(selected)
+    for hit in selected:
+        body = body_by_document.get(hit.documentId)
+        if hit.field == "summary" and body is not None and body not in used \
+                and scores[body] + BODY_SCORE_MARGIN >= scores[hit]:
+            used.add(body)
+            passages.append(body)
+        else:
+            passages.append(hit)
+    return tuple(passages)
 
 
 @asynccontextmanager

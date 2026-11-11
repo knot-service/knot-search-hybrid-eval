@@ -39,6 +39,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledIfEnvironmentVariable;
@@ -117,6 +118,7 @@ class SearchHybridDatasetReplayTest {
         }
 
         Map<Long, SearchHybridWorkflow.Result> observed = new ConcurrentHashMap<>();
+        Map<Long, ModelObservation> modelObservations = observeModel();
         doAnswer(call -> {
             SearchToolScope scope = call.getArgument(0);
             SearchHybridWorkflow.Result result = (SearchHybridWorkflow.Result) call.callRealMethod();
@@ -150,7 +152,8 @@ class SearchHybridDatasetReplayTest {
                                         workspace.id(),
                                         member,
                                         item,
-                                        observed
+                                        observed,
+                                        modelObservations
                                 )
                         );
                     }
@@ -250,6 +253,7 @@ class SearchHybridDatasetReplayTest {
             );
         }
         Map<Long, SearchHybridWorkflow.Result> observed = new ConcurrentHashMap<>();
+        Map<Long, ModelObservation> modelObservations = observeModel();
         doAnswer(call -> {
             SearchToolScope scope = call.getArgument(0);
             SearchHybridWorkflow.Result result = (SearchHybridWorkflow.Result) call.callRealMethod();
@@ -405,7 +409,8 @@ class SearchHybridDatasetReplayTest {
                             cited,
                             event.answer(),
                             event.firstNanos(),
-                            event.completedNanos()
+                            event.completedNanos(),
+                            modelObservations.remove(event.answerId())
                     )
             );
         }
@@ -564,7 +569,8 @@ class SearchHybridDatasetReplayTest {
             List<Long> citedIds,
             String answer,
             Long firstNanos,
-            Long completedNanos
+            Long completedNanos,
+            ModelObservation model
     ) {
     }
 
@@ -659,12 +665,34 @@ class SearchHybridDatasetReplayTest {
         return rows;
     }
 
+    private Map<Long, ModelObservation> observeModel() {
+        Map<Long, ModelObservation> observations = new ConcurrentHashMap<>();
+        if (!"true".equals(System.getenv("KNOT_QUALITY_CAPTURE_MODEL"))) {
+            return observations;
+        }
+        doAnswer(call -> {
+            SearchToolScope scope = call.getArgument(0);
+            List<Map<String, Object>> messages = call.getArgument(1);
+            Consumer<String> downstream = call.getArgument(2);
+            StringBuilder raw = new StringBuilder();
+            call.getRawArguments()[2] = (Consumer<String>) delta -> {
+                raw.append(delta);
+                downstream.accept(delta);
+            };
+            call.callRealMethod();
+            observations.put(scope.answerId(), new ModelObservation(messages, raw.toString()));
+            return null;
+        }).when(llm).streamStructuredAnswer(any(), any(), any());
+        return observations;
+    }
+
     private SseObservation verifySse(
             HttpClient http,
             long workspace,
             long member,
             EvalCase item,
-            Map<Long, SearchHybridWorkflow.Result> observed
+            Map<Long, SearchHybridWorkflow.Result> observed,
+            Map<Long, ModelObservation> modelObservations
     ) throws Exception {
         clearInvocations(llm);
         long started = System.nanoTime();
@@ -754,7 +782,8 @@ class SearchHybridDatasetReplayTest {
                 cited,
                 answer.toString(),
                 firstDeltaNanos,
-                System.nanoTime() - started
+                System.nanoTime() - started,
+                modelObservations.remove(answerId)
         );
     }
 
@@ -978,7 +1007,13 @@ class SearchHybridDatasetReplayTest {
             List<Long> citedIds,
             String answer,
             long firstDeltaNanos,
-            long totalNanos
+            long totalNanos,
+            ModelObservation model
+    ) {
+    }
+    private record ModelObservation(
+            List<Map<String, Object>> messages,
+            String raw
     ) {
     }
     private record Report(

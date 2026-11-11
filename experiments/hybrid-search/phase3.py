@@ -138,6 +138,51 @@ def assemble(
     return tuple(contexts)
 
 
+def assemble_worker_context(
+    hits: tuple[Hit, ...], source: dict[int, SourceDoc],
+    tokenizer: PreTrainedTokenizerFast, limits: dict[Hit, int],
+) -> tuple[Context, ...]:
+    windows = []
+    for hit in hits[:CONTEXT_COUNT]:
+        doc = source[hit.documentId]
+        extent = adjacent_paragraphs(doc, hit)
+        offsets = tokenizer(
+            material(doc, extent)[extent.start:extent.end], add_special_tokens=False,
+            return_offsets_mapping=True, verbose=False,
+        )["offset_mapping"]
+        child_start = next((i for i, (_, end) in enumerate(offsets)
+                            if extent.start + end > hit.start), len(offsets))
+        child_end = next((i for i, (start, _) in enumerate(offsets)
+                          if extent.start + start >= hit.end), len(offsets))
+        limit = limits.get(hit, CONTEXT_BUDGET)
+        windows.append((extent, offsets, child_start, min(child_end - child_start, limit), min(len(offsets), limit)))
+
+    # Spend the shared budget on matching children before expanding any Parent.
+    budgets = [0] * len(windows)
+    remaining = CONTEXT_BUDGET
+    for limits_by_window in ([window[3] for window in windows], [window[4] for window in windows]):
+        while remaining and (open_windows := [i for i, limit in enumerate(limits_by_window) if budgets[i] < limit]):
+            share = max(1, remaining // len(open_windows))
+            for index in open_windows:
+                added = min(share, limits_by_window[index] - budgets[index], remaining)
+                budgets[index] += added
+                remaining -= added
+
+    contexts = []
+    for (extent, offsets, child_start, _, _), taken in zip(windows, budgets, strict=True):
+        if not taken:
+            continue
+        first = min(child_start, len(offsets) - taken)
+        passage = extent.model_copy(update={
+            "start": extent.start + offsets[first][0],
+            "end": extent.start + offsets[first + taken - 1][1],
+        })
+        if not any(item.hit.documentId == passage.documentId and item.hit.field == passage.field
+                   and item.hit.start <= passage.start and item.hit.end >= passage.end for item in contexts):
+            contexts.append(Context(hit=passage, tokenCount=taken))
+    return tuple(contexts)
+
+
 def quality(
     case: DraftCase, hits: tuple[Hit, ...], source: dict[int, SourceDoc],
     tokenizer: PreTrainedTokenizerFast, *, expand: bool,
