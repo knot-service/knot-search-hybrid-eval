@@ -1,18 +1,20 @@
 """Replay captured Spring scopes and compare retrieval settings on fixed evidence."""
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import lru_cache
 from hashlib import sha256
 import json
 from pathlib import Path
 from threading import Lock
 
-from phase4_retrieval import BASELINE, SPARE_SLOT_SETTINGS, RankRequest, RetrievalSettings, app, lifespan
+from phase4_retrieval import (
+    BASELINE, SPARE_SLOT_SETTINGS, SUPPORTING_DOCUMENT_SETTINGS, RankRequest, RetrievalSettings, app, lifespan,
+)
 from phase5_eval import FIND, SYNTHESIS
 from quality1_eval import SYNTHETIC_SPANS, span_match, synthetic_match
 from database import LOCAL, vector_literal
 from phase2 import fuse, percentiles
-from phase3 import adjacent_paragraphs
+from phase3 import adjacent_paragraphs, material
 
 
 def read(path):
@@ -64,7 +66,7 @@ class Replay:
             BASELINE.model_copy(update=dict(keyword_depth=keyword_depth, vector_depth=vector_depth)),
         )
 
-    def run(self, settings, cohort, *, compare_spring=False, selection_misses=None):
+    def run(self, settings, cohort, *, compare_spring=False, selection_misses=None, support_trace=None):
         requests, observations = self.requests(cohort)
         stats, matched = {}, {}
         for ws in self.workspaces:
@@ -85,11 +87,15 @@ class Replay:
                     keyword, vector = self.rank_sources(request, settings.keyword_depth, settings.vector_depth)
                     candidates = fuse(keyword, vector, settings.fusion_depth, settings.fusion_reserve)
                     selected = []
+                    support = []
                     retriever = self.state.retrievers[wid]
                     result = retriever.with_context(
                         request, candidates, self.reranker,
                         self.lock, self.lock, settings, on_selected=selected.extend,
+                        on_supporting=(lambda *details: support.extend(details)) if support_trace is not None else None,
                     )
+                    if support_trace is not None:
+                        support_trace[(wid, case["id"])] = (candidates, support, result.supportingPassages)
                     if wid == 1:
                         stages = {
                             name: [adjacent_paragraphs(retriever.source[hit.documentId], hit).model_dump()
@@ -274,9 +280,117 @@ def compare_supporting_documents(replay, root):
     }, indent=2) + "\n")
 
 
+def compare_supporting_selection(replay, root, stage):
+    previous = read(root / "supporting-documents.json")
+    existing = read(root / "other-doc-live-candidate/phase5-spring-report.json")["replay"]
+    by_case = {r["caseId"]: r["passages"] for r in existing if r["workspaceId"] == 1}
+    target = {tuple(row) for row in previous["target"]
+              if row[1] not in {p["documentId"] for p in by_case[row[0]]}}
+    assert len(target) == 49
+    settings = SUPPORTING_DOCUMENT_SETTINGS
+    trace = {}
+    baseline, before = replay.run(settings, "dates", support_trace=trace)
+    assert baseline[1]["matched"] == 409 and not (target & before[1])
+    documents = {doc["id"]: doc["meetingId"] for w in replay.workspaces if w["id"] == 1 for doc in w["documents"]}
+    misses = []
+    for case, doc, field, start, end in sorted(target):
+        candidates, details, _ = trace.get((1, case), ((), (), ()))
+        if not details:
+            reason = "no_support_route"
+        else:
+            primary, choices, budget = details
+            primary_meetings = {documents[hit.documentId] for hit in primary}
+            if not any(hit.documentId == doc for hit in candidates):
+                reason = "missing_candidate"
+            elif documents[doc] not in primary_meetings:
+                reason = "missing_primary_meeting"
+            elif not budget:
+                reason = "no_spare_tokens"
+            elif not any(hit.documentId == doc for hit in choices):
+                reason = "another_document_selected"
+            else:
+                reason = "selected_but_not_emitted"
+        misses.append({"case": case, "document": doc, "field": field, "start": start, "end": end, "reason": reason})
+    print("control", baseline, dict(Counter(row["reason"] for row in misses)), flush=True)
+    trials = []
+    shared = stage == "supporting-selection-shared"
+    variants = ((2, 8, False), (5, 8, False), (10, 8, False), (20, 8, False),
+                (10, 0, False), (5, 16, False), (0, 8, True), (5, 8, True), (10, 8, True))
+    if shared:
+        variants = tuple((rrf, 8, False) for rrf in (0, 2, 5, 10, 20))
+    elif stage == "supporting-selection-light":
+        variants = tuple((rrf, 8, extra) for rrf in (0.25, 0.5, 1, 1.5, 2) for extra in (False, True))
+    for rrf, lexical, extra in variants:
+        config = settings.model_copy(update={
+            "supporting_rrf_bonus": rrf, "supporting_lexical_bonus": lexical, "supporting_extra_per_meeting": extra,
+            "supporting_shared_slots": shared,
+        })
+        stats, after = replay.run(config, "dates")
+        delta = compare(before, after)
+        result = {"settings": config.model_dump(), "stats": stats, "delta": delta,
+                  "targetRecovered": len(target & after[1]), **changed_spans(before, after)}
+        trials.append(result)
+        print((rrf, lexical, extra), stats[1]["matched"], delta, result["targetRecovered"],
+              stats[1]["meetings"], stats[458]["meetings"], stats[458]["matched"], flush=True)
+    (root / f"{stage}.json").write_text(json.dumps({
+        "baseline": baseline, "target": sorted(target), "misses": misses, "trials": trials,
+    }, indent=2) + "\n")
+
+
+def explain_supporting_misses(replay, root):
+    target = read(root / "supporting-selection.json")["target"]
+    questions = {c["id"]: c["question"] for w in replay.workspaces if w["id"] == 1 for c in w["cases"]}
+    scopes, _ = replay.requests("dates")
+    retriever = replay.state.retrievers[1]
+    settings = SUPPORTING_DOCUMENT_SETTINGS
+    by_case = defaultdict(list)
+    for row in target:
+        by_case[row[0]].append(row)
+    audit = []
+    for case, spans in by_case.items():
+        question = questions[case]
+        request = scopes[1, sha256(question.encode()).hexdigest()].model_copy(update={"question": question})
+        keyword, vector = replay.rank_sources(request, settings.keyword_depth, settings.vector_depth)
+        candidates = fuse(keyword, vector, settings.fusion_depth, settings.fusion_reserve)
+        pairs = [(question, f"{retriever.source[hit.documentId].title}\n"
+                  f"{material(retriever.source[hit.documentId], hit)[hit.start:hit.end]}") for hit in candidates]
+        values = replay.reranker.predict(pairs, batch_size=10, show_progress_bar=False)
+        relevance = dict(zip(candidates, map(float, values), strict=True))
+        trace = []
+        retriever.with_context(request, candidates, replay.reranker, replay.lock, replay.lock, settings,
+                               on_supporting=lambda *details: trace.extend(details))
+        primary, choices, budget = trace
+        primary_docs = {hit.documentId for hit in primary}
+        primary_meetings = {retriever.source[doc].meetingId for doc in primary_docs}
+        eligible = tuple(hit for hit in sorted(candidates, key=relevance.__getitem__, reverse=True)
+                         if hit.documentId not in primary_docs
+                         and retriever.source[hit.documentId].meetingId in primary_meetings)
+        scores = retriever.supporting_scores(question, primary, eligible, candidates, relevance, settings)
+        for span in spans:
+            document = span[1]
+            meeting = retriever.source[document].meetingId
+            winner = next(hit for hit in choices if retriever.source[hit.documentId].meetingId == meeting)
+            order = tuple(dict.fromkeys(hit.documentId for hit in sorted(eligible, key=lambda h: sum(scores[h]), reverse=True)
+                                       if retriever.source[hit.documentId].meetingId == meeting))
+            missed = max((hit for hit in eligible if hit.documentId == document), key=lambda hit: sum(scores[hit]))
+            gaps = [a - b for a, b in zip(scores[winner], scores[missed], strict=True)]
+            reason = ("reranker" if gaps[0] > 0 else "overlap" if sum(gaps[:2]) > 0
+                      else "lexical" if sum(gaps[:3]) > 0 else "tie")
+            audit.append({"span": span, "chosenDocument": winner.documentId, "supportRank": order.index(document) + 1,
+                          "budget": budget, "reason": reason, "scoreGaps": gaps})
+    (root / "supporting-selection-causes.json").write_text(json.dumps(audit, indent=2) + "\n")
+    print(dict(Counter(row["reason"] for row in audit)), dict(Counter(row["supportRank"] for row in audit)), flush=True)
+
+
 async def run(root, stage):
     async with lifespan(app):
         replay = Replay(root, app.state)
+        if stage == "supporting-selection-causes":
+            explain_supporting_misses(replay, root)
+            return
+        if stage.startswith("supporting-selection"):
+            compare_supporting_selection(replay, root, stage)
+            return
         if stage == "supporting-documents":
             compare_supporting_documents(replay, root)
             return
@@ -373,6 +487,7 @@ if __name__ == "__main__":
     parser.add_argument("stage", choices=(
         "selection", "remaining", "followup", "supplement-overlap",
         "meeting-representatives", "meeting-representatives-rrf", "meeting-representatives-refine", "supporting-documents",
+        "supporting-selection", "supporting-selection-shared", "supporting-selection-light", "supporting-selection-causes",
     ))
     args = parser.parse_args()
     asyncio.run(run(args.root, args.stage))
