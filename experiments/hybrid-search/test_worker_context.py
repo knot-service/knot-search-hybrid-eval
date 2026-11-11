@@ -66,6 +66,33 @@ class WorkerContextTest(TestCase):
         self.assertEqual([2], [passage.documentId for passage in response.supportingPassages])
         self.assertEqual(100, sum(p.tokenCount for p in (*response.passages, *response.supportingPassages)))
 
+    def test_extra_rrf_preserves_primary_and_first_support_passages(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.source = {
+            i: document(i, letter * 20).model_copy(update={"meetingId": 1})
+            for i, letter in enumerate("가나다라", 1)
+        }
+        retriever.tokenizer = character_offsets
+        candidates = tuple(Hit(documentId=i, field="body", start=0, end=20) for i in (4, 1, 3, 2))
+
+        class Reranker:
+            def predict(self, pairs, **options):
+                return (5.5, 10.0, 6.0, 9.0)
+
+        request = RankRequest(workspaceId=1, question="근거", allowedDocumentIds=(1, 2, 3, 4),
+                              contextMode="synthesis")
+        settings = RetrievalSettings(context_budget=60, supporting_excerpt_tokens=20,
+                                     supporting_extra_per_meeting=True)
+        before = retriever.with_context(request, candidates, Reranker(), Lock(), Lock(), settings)
+        after = retriever.with_context(request, candidates, Reranker(), Lock(), Lock(),
+                                       settings.model_copy(update={"extra_support_rrf_bonus": 5.0}))
+
+        self.assertEqual(before.passages, after.passages)
+        self.assertEqual(before.supportingPassages[0], after.supportingPassages[0])
+        self.assertEqual([2, 3], [passage.documentId for passage in before.supportingPassages])
+        self.assertEqual([2, 4], [passage.documentId for passage in after.supportingPassages])
+        self.assertEqual(60, sum(p.tokenCount for p in (*after.passages, *after.supportingPassages)))
+
     def test_representative_can_change_document_without_changing_the_selected_meetings(self):
         retriever = Retriever.__new__(Retriever)
         retriever.source = {

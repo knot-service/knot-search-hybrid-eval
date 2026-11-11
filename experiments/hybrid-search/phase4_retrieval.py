@@ -46,6 +46,8 @@ class RetrievalSettings(Frozen):
     supporting_rrf_bonus: float = 0.0
     supporting_extra_per_meeting: bool = False
     supporting_shared_slots: bool = False
+    extra_support_rrf_bonus: float | None = None
+    extra_support_reserve_tokens: int = Field(default=0, ge=0)
     supporting_in_questions: bool = False
     keyword_depth: int = DEPTH
     vector_depth: int = DEPTH
@@ -80,6 +82,7 @@ SUPPORTING_DOCUMENT_SETTINGS = SPARE_SLOT_SETTINGS.model_copy(update={
 SUPPORTING_SELECTION_SETTINGS = SUPPORTING_DOCUMENT_SETTINGS.model_copy(update={
     "supporting_extra_per_meeting": True,
 })
+PROTECTED_SUPPORT_SETTINGS = SUPPORTING_SELECTION_SETTINGS.model_copy(update={"extra_support_rrf_bonus": 5.0})
 
 
 class RankRequest(Frozen):
@@ -216,18 +219,27 @@ class Retriever:
                         request.question, primary_hits, ranked, candidates, relevance, settings,
                         per_meeting=2 if settings.supporting_shared_slots else 1,
                     )
+                    extra_settings = settings
+                    if settings.extra_support_rrf_bonus is not None:
+                        extra_settings = settings.model_copy(update={"supporting_rrf_bonus": settings.extra_support_rrf_bonus})
+                    can_add_support = settings.supporting_extra_per_meeting and not settings.supporting_shared_slots
+                    reserved = 0
+                    if can_add_support and settings.extra_support_reserve_tokens:
+                        reserve_candidates = self.supporting_documents(
+                            request.question, (*primary_hits, *extras), ranked, candidates, relevance, extra_settings,
+                        )[:CONTEXT_COUNT - len(extras)]
+                        reserved = min(len(reserve_candidates) * settings.extra_support_reserve_tokens, support_budget // 3)
                     supports = assemble_worker_context(
                         extras, self.source, self.tokenizer,
                         dict.fromkeys(extras, settings.supporting_excerpt_tokens),
-                        budget=support_budget, focus=request.question,
+                        budget=support_budget - reserved, focus=request.question,
                     )
                     extra_tokens = sum(item.tokenCount for item in supports)
                     spare = support_budget - extra_tokens
-                    if (settings.supporting_extra_per_meeting and not settings.supporting_shared_slots
-                            and spare and len(supports) < CONTEXT_COUNT):
+                    if can_add_support and spare and len(supports) < CONTEXT_COUNT:
                         extras_after = self.supporting_documents(
                             request.question, (*primary_hits, *(item.hit for item in supports)),
-                            ranked, candidates, relevance, settings,
+                            ranked, candidates, relevance, extra_settings,
                         )[:CONTEXT_COUNT - len(supports)]
                         supports += assemble_worker_context(
                             extras_after, self.source, self.tokenizer,
@@ -434,7 +446,9 @@ def prefer_source_text(selected: tuple[Hit, ...], ranked: tuple[Hit, ...],
 async def lifespan(app: FastAPI):
     torch.set_num_threads(4)
     app.state.worker_settings = SPARE_SLOT_SETTINGS
-    if os.environ.get("KNOT_HYBRID_SUPPORTING_SELECTION") == "true":
+    if os.environ.get("KNOT_HYBRID_PROTECTED_SUPPORT") == "true":
+        app.state.worker_settings = PROTECTED_SUPPORT_SETTINGS
+    elif os.environ.get("KNOT_HYBRID_SUPPORTING_SELECTION") == "true":
         app.state.worker_settings = SUPPORTING_SELECTION_SETTINGS
     elif os.environ.get("KNOT_HYBRID_SUPPORTING_CONTEXT") == "true":
         app.state.worker_settings = SUPPORTING_DOCUMENT_SETTINGS
