@@ -108,11 +108,15 @@ public class SearchHybridIndexClient implements AutoCloseable {
             List<Long> documentIds,
             List<Passage> passages,
             List<Passage> supportingPassages,
+            List<Passage> shortPassages,
+            List<Passage> discoveryPassages,
             double rerankMs,
             double contextMs
     ) {
         public Output {
             supportingPassages = supportingPassages == null ? List.of() : List.copyOf(supportingPassages);
+            shortPassages = shortPassages == null ? List.of() : List.copyOf(shortPassages);
+            discoveryPassages = discoveryPassages == null ? List.of() : List.copyOf(discoveryPassages);
         }
     }
 

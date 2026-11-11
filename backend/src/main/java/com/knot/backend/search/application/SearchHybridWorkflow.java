@@ -32,6 +32,9 @@ public class SearchHybridWorkflow {
     private static final int MAX_EXPANDED_CONTEXT_TOKENS = 6144;
     private static final int SUPPORTING_CONTEXT_TOKENS = 2048;
     private static final int MAX_PASSAGES_PER_KIND = 5;
+    private static final int MAX_SHORT_PASSAGES = 4;
+    private static final int MAX_SHORT_PASSAGE_TOKENS = 96;
+    private static final int MAX_DISCOVERY_PASSAGE_TOKENS = 320;
     private static final int MAX_SUPPORTING_DOCUMENTS_PER_MEETING = 2;
     private static final DateTimeFormatter MEETING_TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss XXX")
             .withZone(ZoneId.of("Asia/Seoul"));
@@ -132,6 +135,8 @@ public class SearchHybridWorkflow {
                     question,
                     ranking.passages(),
                     ranking.supportingPassages(),
+                    ranking.shortPassages(),
+                    ranking.discoveryPassages(),
                     allowed,
                     verified
             );
@@ -206,15 +211,27 @@ public class SearchHybridWorkflow {
             SearchHybridQuestion question,
             List<Passage> passages,
             List<Passage> supportingPassages,
+            List<Passage> shortPassages,
+            List<Passage> discoveryPassages,
             Map<Long, EligibleDocument> allowed,
             List<Passage> verified
     ) {
         int passageLimit = evidenceExpansion ? 7 : MAX_PASSAGES_PER_KIND;
         if (passages == null || passages.size() > passageLimit
-                || supportingPassages.size() > passageLimit) {
+                || supportingPassages.size() > passageLimit
+                || shortPassages.size() > (evidenceExpansion ? MAX_SHORT_PASSAGES : 0)
+                || discoveryPassages.size() > (evidenceExpansion ? MAX_SHORT_PASSAGES : 0)
+                || shortPassages.stream().anyMatch(
+                        passage -> !"body".equals(passage.field()) || passage.tokenCount() > MAX_SHORT_PASSAGE_TOKENS
+                )
+                || discoveryPassages.stream().anyMatch(
+                        passage -> !"body".equals(passage.field()) || passage.tokenCount() > MAX_DISCOVERY_PASSAGE_TOKENS
+                )) {
             throw new IllegalStateException("Invalid hybrid context budget");
         }
-        var allPassages = Stream.concat(passages.stream(), supportingPassages.stream()).toList();
+        var allPassages = Stream.of(passages, supportingPassages, shortPassages, discoveryPassages)
+                .flatMap(List::stream)
+                .toList();
         int budget = supportingPassages.isEmpty() ? CONTEXT_TOKENS : SUPPORTING_CONTEXT_TOKENS;
         if (evidenceExpansion) {
             budget = evidenceExpansionBudget;
@@ -246,6 +263,10 @@ public class SearchHybridWorkflow {
                                 Collectors.toList()
                         )
                 );
+        discoveryPassages.stream()
+                .filter(passage -> allowed.containsKey(passage.documentId()))
+                .forEach(passage -> byDocument.computeIfAbsent(passage.documentId(), key -> new ArrayList<>()).add(passage));
+        var shortByDocument = shortPassages.stream().collect(Collectors.groupingBy(Passage::documentId));
         var entries = byDocument.entrySet()
                 .stream();
         if (question.route() == Route.MULTI_MEETING_SYNTHESIS) {
@@ -265,6 +286,7 @@ public class SearchHybridWorkflow {
                                 doc -> excerpt(
                                         doc,
                                         entry.getValue(),
+                                        shortByDocument.getOrDefault(entry.getKey(), List.of()),
                                         verified
                                 )
                         )
@@ -276,6 +298,7 @@ public class SearchHybridWorkflow {
     private Optional<SearchDocumentResult> excerpt(
             SearchDocumentRecord doc,
             List<Passage> passages,
+            List<Passage> shortPassages,
             List<Passage> verified
     ) {
         List<Passage> valid = passages.stream()
@@ -289,8 +312,10 @@ public class SearchHybridWorkflow {
         if (valid.isEmpty()) {
             return Optional.empty();
         }
-        verified.addAll(valid);
-        List<String> quotes = valid.stream()
+        var evidence = Stream.concat(valid.stream(), shortPassages.stream().filter(passage -> exactPassage(doc, passage)))
+                .toList();
+        verified.addAll(evidence);
+        List<String> quotes = evidence.stream()
                 .map(Passage::quote)
                 .toList();
         String text = "회의 시각(한국): " + MEETING_TIME.format(doc.recordingStartedAt()) + "\n" + String.join(

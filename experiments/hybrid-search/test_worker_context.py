@@ -5,8 +5,8 @@ from build_dataset import SourceDoc
 from evidence_expansion import expand_evidence
 from phase1 import Hit
 from phase3 import CONTEXT_BUDGET, Context, assemble, assemble_worker_context, complete_excerpt_boundaries
-from phase4_retrieval import RankRequest, RetrievalSettings, Retriever, prefer_source_text
-from same_document_evidence import extend_same_document
+from phase4_retrieval import RankRequest, RankResponse, RetrievalSettings, Retriever, prefer_source_text
+from same_document_evidence import extend_same_document, select_short_passages
 
 
 def document(doc_id: int, body: str) -> SourceDoc:
@@ -19,6 +19,49 @@ def character_offsets(text: str, **_options) -> dict:
 
 
 class WorkerContextTest(TestCase):
+    def test_discovery_reranks_only_new_chunks_and_keeps_the_representative(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.source = {1: document(1, "기존 대표 근거"), 2: document(2, "결제 영수증 기준")}
+
+        def tokenizer(text, **options):
+            return {"input_ids": list(text), **character_offsets(text, **options)}
+
+        retriever.tokenizer = tokenizer
+        main, extra = (Hit(documentId=d.id, field="body", start=0, end=len(d.body))
+                       for d in retriever.source.values())
+        baseline = RankResponse(documentIds=(1,), passages=retriever.passages(
+            (Context(hit=main, tokenCount=main.end),),
+        ))
+
+        class Reranker:
+            def predict(self, pairs, **_options):
+                assert pairs == [("결제 영수증", "\n결제 영수증 기준")]
+                return (1,)
+
+        result = retriever.discover(
+            "결제 영수증", (main, extra), (), (main,), baseline, Reranker(), Lock(), Lock(),
+            RetrievalSettings(expansion_budget=128),
+        )
+
+        self.assertEqual(baseline.passages, result.passages)
+        self.assertEqual([2], [passage.documentId for passage in result.discoveryPassages])
+
+    def test_reserved_short_passage_selects_a_separate_excerpt_from_a_selected_document(self):
+        original = "회의 시작"
+        target = "결제 승인 조건은 영수증 확인이다."
+        body = original + "\n" + ("다른 내용 " * 40) + "\n" + target
+        source = {1: document(1, body), 2: document(2, target)}
+        passages = (Context(hit=Hit(documentId=1, field="body", start=0, end=len(original)),
+                            tokenCount=len(original)),)
+
+        def tokenizer(text, **_options):
+            return {"input_ids": list(text)}
+
+        selected = select_short_passages("결제 승인 조건?", passages, source, tokenizer, budget=len(target))
+
+        hit = Hit(documentId=1, field="body", start=len(body) - len(target), end=len(body))
+        self.assertEqual((Context(hit=hit, tokenCount=len(target)),), selected)
+
     def test_same_document_extension_keeps_original_excerpt_and_fits_spare_budget(self):
         original = "첫 회의 내용"
         relevant = "결제 승인 기준은 영수증 확인이다."

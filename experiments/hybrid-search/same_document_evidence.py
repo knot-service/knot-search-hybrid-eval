@@ -9,7 +9,10 @@ from build_dataset import SourceDoc
 from evidence_expansion import token_count
 from experiment import tokens
 from phase1 import Hit
-from phase3 import Context
+from phase3 import Context, material
+
+SHORT_PASSAGE_COUNT = 4
+SHORT_PASSAGE_TOKENS = 96
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +41,50 @@ def sections(text: str, query: frozenset[str]) -> list[Section]:
             left = start + len(raw) - len(raw.lstrip())
             result.append(Section(left, left + len(body), overlap))
     return result
+
+
+def select_short_passages(
+    question: str, passages: tuple[Context, ...], source: dict[int, SourceDoc],
+    tokenizer: PreTrainedTokenizerFast, *, budget: int,
+) -> tuple[Context, ...]:
+    """Spend reserved tokens on short source excerpts from documents already selected."""
+    query = features(question)
+    existing: dict[int, list[Hit]] = defaultdict(list)
+    for passage in passages:
+        existing[passage.hit.documentId].append(passage.hit)
+    options: list[tuple[float, Context]] = []
+    for doc, windows in existing.items():
+        body = source[doc].body
+        candidates = sections(body, query)
+        frequency = Counter(term for section in candidates for term in section.terms)
+        covered = query.intersection(features(" ".join(
+            material(source[doc], hit)[hit.start:hit.end] for hit in windows
+        )))
+        for section in candidates:
+            if len(section.terms) < 2 or any(
+                hit.field == "body" and hit.start <= section.start and hit.end >= section.end for hit in windows
+            ):
+                continue
+            hit = Hit(documentId=doc, field="body", start=section.start, end=section.end)
+            count = token_count(source, tokenizer, hit)
+            if 0 < count <= min(budget, SHORT_PASSAGE_TOKENS):
+                score = sum((2 if term not in covered else 1) / frequency[term] for term in sorted(section.terms))
+                options.append((score, Context(hit=hit, tokenCount=count)))
+
+    selected: list[Context] = []
+    documents: set[int] = set()
+    options.sort(key=lambda option: (
+        -option[0], option[1].tokenCount, option[1].hit.documentId, option[1].hit.start, option[1].hit.end,
+    ))
+    for _, option in options:
+        doc = option.hit.documentId
+        if option.tokenCount <= budget and doc not in documents:
+            selected.append(option)
+            documents.add(doc)
+            budget -= option.tokenCount
+            if len(selected) == SHORT_PASSAGE_COUNT:
+                break
+    return tuple(selected)
 
 
 def extend_same_document(

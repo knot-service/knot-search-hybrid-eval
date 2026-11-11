@@ -21,14 +21,14 @@ from transformers import PreTrainedTokenizerFast
 from build_dataset import Frozen, SourceDoc, documents
 from database import connect, vector_literal
 from experiment import MODEL, REVISION, tokens
-from evidence_expansion import expand_evidence
+from evidence_expansion import compact_overlaps, expand_evidence
 from phase1 import Hit, chunks, prepare
 from phase2 import DEPTH, fuse, ms
 from phase3 import (
     CONTEXT_BUDGET, CONTEXT_COUNT, RERANKER, RERANKER_REVISION, Context,
     adjacent_paragraphs, assemble_worker_context, complete_excerpt_boundaries, material,
 )
-from same_document_evidence import extend_same_document
+from same_document_evidence import extend_same_document, select_short_passages
 
 BODY_SCORE_MARGIN = 1.0
 WEAK_SCORE_GAP = 6.25
@@ -74,6 +74,16 @@ class RetrievalSettings(Frozen):
     expansion_compact: bool = False
     expansion_order: Literal["rank", "documents"] = "rank"
     same_document_tokens: int = Field(default=0, ge=0, le=768)
+    short_passage_reserve: int = Field(default=0, ge=0, le=512)
+    short_passages_spare_only: bool = False
+    rerank_supplemental: bool = False
+    discovery_depth: int = Field(default=0, ge=0, le=160)
+    discovery_rerank_limit: int = Field(default=48, ge=1, le=80)
+    discovery_compact: bool = True
+    discovery_window_rerank: bool = False
+    discovery_uncovered_only: bool = False
+    discovery_excerpt_tokens: int = Field(default=96, ge=96, le=320)
+    discovery_existing_first: bool = False
 
 
 BASELINE = RetrievalSettings()
@@ -136,6 +146,8 @@ class RankResponse(Frozen):
     documentIds: tuple[int, ...]
     passages: tuple[Passage, ...] = ()
     supportingPassages: tuple[Passage, ...] = ()
+    shortPassages: tuple[Passage, ...] = ()
+    discoveryPassages: tuple[Passage, ...] = ()
     rerankMs: float = 0
     contextMs: float = 0
 
@@ -220,7 +232,8 @@ class Retriever:
         if request.contextMode == "none" or not candidates:
             return RankResponse(documentIds=document_ids)
 
-        first_pass = candidates[:settings.fusion_depth] if settings.late_fusion else candidates
+        core_candidates = candidates[:settings.fusion_depth] if settings.late_fusion else candidates
+        first_pass = candidates if settings.rerank_supplemental else core_candidates
         pairs = [(request.question, f"{self.source[hit.documentId].title}\n"
                   f"{material(self.source[hit.documentId], hit)[hit.start:hit.end]}") for hit in first_pass]
         started = perf_counter()
@@ -324,7 +337,7 @@ class Retriever:
                     request.question, contexts, supports, ranked, relevance, settings,
                 )
             if settings.late_fusion:
-                fallback = candidates[len(first_pass):]
+                fallback = candidates[len(core_candidates):]
                 fallback_scores = {hit: -index for index, hit in enumerate(fallback)}
                 contexts, supports = self.use_fusion_fallback(
                     request.question, contexts, supports, fallback, fallback_scores, settings,
@@ -333,23 +346,142 @@ class Retriever:
                 contexts, supports = complete_excerpt_boundaries(
                     contexts, supports, self.source, self.tokenizer, settings.context_budget, settings.boundary_tokens,
                 )
+            short = ()
             if settings.expansion_budget:
+                reserve = 0 if settings.short_passages_spare_only else settings.short_passage_reserve
                 contexts, supports = expand_evidence(
                     request.question, contexts, supports, candidates, self.source, self.tokenizer,
-                    budget=settings.expansion_budget, excerpt_tokens=settings.expansion_excerpt_tokens,
+                    budget=settings.expansion_budget - reserve,
+                    excerpt_tokens=settings.expansion_excerpt_tokens,
                     passages_per_kind=settings.expansion_slots,
                     supports_per_meeting=settings.expansion_supports_per_meeting,
                     compact=settings.expansion_compact, order=settings.expansion_order,
                 )
+                if reserve:
+                    short = select_short_passages(
+                        request.question, (*contexts, *supports), self.source, self.tokenizer,
+                        budget=reserve,
+                    )
                 if settings.same_document_tokens:
                     excerpts = extend_same_document(
                         request.question, (*contexts, *supports), self.source, self.tokenizer,
-                        budget=settings.expansion_budget, max_added=settings.same_document_tokens,
+                        budget=settings.expansion_budget - sum(item.tokenCount for item in short),
+                        max_added=settings.same_document_tokens,
                     )
                     contexts, supports = excerpts[:len(contexts)], excerpts[len(contexts):]
+                if settings.short_passages_spare_only and settings.short_passage_reserve:
+                    available = settings.expansion_budget - sum(item.tokenCount for item in (*contexts, *supports))
+                    if available > 0:
+                        short = select_short_passages(
+                            request.question, (*contexts, *supports), self.source, self.tokenizer,
+                            budget=min(available, settings.short_passage_reserve),
+                        )
         return RankResponse(documentIds=document_ids, passages=self.passages(contexts),
                             supportingPassages=self.passages(supports),
+                            shortPassages=self.passages(short),
                             rerankMs=rerank_ms, contextMs=ms(started))
+
+    def discover(self, question: str, keyword: tuple[Hit, ...], vector: tuple[Hit, ...],
+                 candidates: tuple[Hit, ...], baseline: RankResponse, reranker: CrossEncoder,
+                 rerank_lock: Lock, tokenizer_lock: Lock, settings: RetrievalSettings) -> RankResponse:
+        """Rerank additional body candidates after fixing the original selection."""
+        if not baseline.passages:
+            return baseline
+        existing = set(candidates)
+        contexts = tuple(
+            tuple(Context(hit=Hit.model_validate(p.model_dump()), tokenCount=p.tokenCount) for p in passages)
+            for passages in (baseline.passages, baseline.supportingPassages, baseline.shortPassages)
+        )
+        with tokenizer_lock:
+            if settings.discovery_compact:
+                contexts = tuple(compact_overlaps(group, self.source, self.tokenizer) for group in contexts)
+            remaining = settings.expansion_budget - sum(item.tokenCount for group in contexts for item in group)
+        if remaining < 24:
+            return baseline
+        extra = tuple(hit for hit in fuse(keyword, vector, None) if hit.field == "body" and hit not in existing)
+        extra = extra[:settings.discovery_rerank_limit]
+        if not extra:
+            return baseline
+        original = tuple(item.hit for group in contexts for item in group)
+        started = perf_counter()
+        pairs = [(question, f"{self.source[hit.documentId].title}\n"
+                  f"{material(self.source[hit.documentId], hit)[hit.start:hit.end]}") for hit in extra]
+        with rerank_lock:
+            scores = reranker.predict(pairs, batch_size=10, show_progress_bar=False)
+        ranked = tuple(hit for hit, _ in sorted(zip(extra, scores, strict=True), key=lambda pair: -pair[1]))
+        window_rerank = settings.discovery_window_rerank and (
+            not settings.discovery_existing_first or remaining < settings.discovery_excerpt_tokens
+        )
+        if window_rerank:
+            with tokenizer_lock:
+                windows = self.discovery_windows(ranked[:12], original if settings.discovery_uncovered_only else ())
+            if windows:
+                with rerank_lock:
+                    scores = reranker.predict([
+                        (question, f"{self.source[hit.documentId].title}\n"
+                         f"{material(self.source[hit.documentId], hit)[hit.start:hit.end]}") for hit in windows
+                    ], batch_size=10, show_progress_bar=False)
+                ranked = tuple(hit for hit, _ in sorted(zip(windows, scores, strict=True), key=lambda pair: -pair[1]))
+        if settings.discovery_existing_first and not window_rerank:
+            selected_documents = {hit.documentId for hit in original}
+            ranked = tuple(sorted(ranked, key=lambda hit: hit.documentId not in selected_documents))
+        rerank_ms = ms(started)
+        started = perf_counter()
+        discovered: list[Context] = []
+        added_documents: set[int] = set()
+        spare = remaining
+        with tokenizer_lock:
+            for hit in ranked:
+                if spare < 24 or len(discovered) == 4:
+                    break
+                if hit.documentId in added_documents:
+                    continue
+                new = assemble_worker_context((hit,), self.source, self.tokenizer, {},
+                                              budget=min(spare, settings.discovery_excerpt_tokens), focus=question,
+                                              extents={hit: hit} if window_rerank else None)
+                if not new:
+                    continue
+                piece = new[0].hit
+                if any(old.documentId == piece.documentId and old.field == piece.field
+                       and old.start <= piece.start and old.end >= piece.end for old in original):
+                    continue
+                discovered.extend(new)
+                spare -= new[0].tokenCount
+                added_documents.add(hit.documentId)
+        if not discovered:
+            return baseline.model_copy(update={"rerankMs": baseline.rerankMs + rerank_ms})
+        primary, supports, short = contexts
+        return baseline.model_copy(update={
+            "documentIds": tuple(dict.fromkeys((*baseline.documentIds, *(item.hit.documentId for item in discovered)))),
+            "passages": self.passages(primary), "supportingPassages": self.passages(supports),
+            "shortPassages": self.passages(short), "discoveryPassages": self.passages(tuple(discovered)),
+            "rerankMs": baseline.rerankMs + rerank_ms, "contextMs": baseline.contextMs + ms(started),
+        })
+
+    def discovery_windows(self, candidates: tuple[Hit, ...], covered: tuple[Hit, ...]) -> tuple[Hit, ...]:
+        windows = []
+        for hit in candidates:
+            cursor = hit.start
+            gaps = []
+            for item in sorted((p for p in covered if p.documentId == hit.documentId and p.field == hit.field
+                                and p.start < hit.end and p.end > hit.start), key=lambda p: p.start):
+                if cursor < item.start:
+                    gaps.append((cursor, item.start))
+                cursor = max(cursor, item.end)
+            if cursor < hit.end:
+                gaps.append((cursor, hit.end))
+            for left, right in gaps:
+                offsets = self.tokenizer(material(self.source[hit.documentId], hit)[left:right],
+                                         add_special_tokens=False, return_offsets_mapping=True,
+                                         verbose=False)["offset_mapping"]
+                for start in range(0, len(offsets), 32):
+                    end = min(start + 96, len(offsets))
+                    windows.append(hit.model_copy(update={
+                        "start": left + offsets[start][0], "end": left + offsets[end - 1][1],
+                    }))
+                    if end == len(offsets):
+                        break
+        return tuple(dict.fromkeys(windows))
 
     def use_fusion_fallback(self, question: str, contexts: tuple[Context, ...], supports: tuple[Context, ...],
                             candidates: tuple[Hit, ...], relevance: dict[Hit, float],
@@ -629,6 +761,16 @@ async def lifespan(app: FastAPI):
         app.state.worker_settings = RetrievalSettings.model_validate({
             **EVIDENCE_EXPANSION_SETTINGS.model_dump(), "expansion_budget": budget,
             "same_document_tokens": int(os.environ.get("KNOT_HYBRID_SAME_DOCUMENT_EVIDENCE_TOKENS", "0")),
+            "short_passage_reserve": int(os.environ.get("KNOT_HYBRID_SHORT_PASSAGE_RESERVE", "0")),
+            "short_passages_spare_only": os.environ.get("KNOT_HYBRID_SHORT_PASSAGES_SPARE_ONLY") == "true",
+            "rerank_supplemental": os.environ.get("KNOT_HYBRID_RERANK_SUPPLEMENTAL") == "true",
+            "discovery_depth": int(os.environ.get("KNOT_HYBRID_DISCOVERY_DEPTH", "0")),
+            "discovery_rerank_limit": int(os.environ.get("KNOT_HYBRID_DISCOVERY_RERANK_LIMIT", "48")),
+            "discovery_compact": os.environ.get("KNOT_HYBRID_DISCOVERY_COMPACT", "true") == "true",
+            "discovery_window_rerank": os.environ.get("KNOT_HYBRID_DISCOVERY_WINDOW_RERANK") == "true",
+            "discovery_uncovered_only": os.environ.get("KNOT_HYBRID_DISCOVERY_UNCOVERED_ONLY") == "true",
+            "discovery_excerpt_tokens": int(os.environ.get("KNOT_HYBRID_DISCOVERY_EXCERPT_TOKENS", "96")),
+            "discovery_existing_first": os.environ.get("KNOT_HYBRID_DISCOVERY_EXISTING_FIRST") == "true",
         })
     elif os.environ.get("KNOT_HYBRID_EVIDENCE_SELECTION") == "true":
         app.state.worker_settings = EVIDENCE_SELECTION_SETTINGS
@@ -677,7 +819,16 @@ def rank(data: RankRequest, request: Request) -> RankResponse:
                                                show_progress_bar=False)[0]
     retriever = request.app.state.retrievers[data.workspaceId]
     settings = BASELINE if data.contextMode == "none" else request.app.state.worker_settings
-    candidates = retriever.rank(data.question, vector_literal(query.tolist()), data.allowedDocumentIds, settings,
-                                data.preferredDocumentId)
-    return retriever.with_context(data, candidates, request.app.state.reranker, request.app.state.rerank_lock,
-                                  request.app.state.embed_lock, settings)
+    embedding = vector_literal(query.tolist())
+    state = request.app.state
+    if settings.discovery_depth and data.contextMode == "synthesis":
+        allowed = (data.preferredDocumentId,) if data.preferredDocumentId in data.allowedDocumentIds else data.allowedDocumentIds
+        wide = settings.model_copy(update={"keyword_depth": max(settings.discovery_depth, settings.keyword_depth),
+                                           "vector_depth": max(settings.discovery_depth, settings.vector_depth)})
+        keyword, vector = retriever.rank_sources(data.question, embedding, allowed, wide)
+        candidates = retriever.fuse_candidates(keyword[:settings.keyword_depth], vector[:settings.vector_depth], settings)
+        baseline = retriever.with_context(data, candidates, state.reranker, state.rerank_lock, state.embed_lock, settings)
+        return retriever.discover(data.question, keyword, vector, candidates, baseline, state.reranker,
+                                  state.rerank_lock, state.embed_lock, settings)
+    candidates = retriever.rank(data.question, embedding, data.allowedDocumentIds, settings, data.preferredDocumentId)
+    return retriever.with_context(data, candidates, state.reranker, state.rerank_lock, state.embed_lock, settings)
