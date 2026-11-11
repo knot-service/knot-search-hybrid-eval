@@ -22,6 +22,7 @@ from build_dataset import Frozen, SourceDoc, documents
 from database import connect, vector_literal
 from experiment import MODEL, REVISION, tokens
 from evidence_expansion import compact_overlaps, expand_evidence
+from meeting_evidence import reserve_meeting_evidence
 from phase1 import Hit, chunks, prepare
 from phase2 import DEPTH, fuse, ms
 from phase3 import (
@@ -84,6 +85,8 @@ class RetrievalSettings(Frozen):
     discovery_uncovered_only: bool = False
     discovery_excerpt_tokens: int = Field(default=96, ge=96, le=320)
     discovery_existing_first: bool = False
+    meeting_evidence_first: bool = False
+    meeting_evidence_reclaim: int = Field(default=0, ge=0, le=256)
 
 
 BASELINE = RetrievalSettings()
@@ -714,6 +717,34 @@ class Retriever:
         return tuple(selected)
 
 
+def pack_meeting_evidence(question: str, result: RankResponse, retriever: Retriever,
+                          settings: RetrievalSettings) -> RankResponse:
+    """Reallocate the synthesis budget without changing the document or meeting selection."""
+    started = perf_counter()
+    groups = (result.passages, result.supportingPassages, result.discoveryPassages)
+    flat = tuple(
+        Context(hit=Hit.model_validate(passage.model_dump()), tokenCount=passage.tokenCount)
+        for group in groups for passage in group
+    )
+    short = tuple(
+        Context(hit=Hit.model_validate(passage.model_dump()), tokenCount=passage.tokenCount)
+        for passage in result.shortPassages
+    )
+    packed = reserve_meeting_evidence(
+        question, flat, short, retriever.source, retriever.tokenizer,
+        budget=settings.expansion_budget, reclaim=settings.meeting_evidence_reclaim,
+    )
+    primary_end = len(result.passages)
+    supporting_end = primary_end + len(result.supportingPassages)
+    return result.model_copy(update={
+        "passages": retriever.passages(packed.passages[:primary_end]),
+        "supportingPassages": retriever.passages(packed.passages[primary_end:supporting_end]),
+        "discoveryPassages": retriever.passages(packed.passages[supporting_end:]),
+        "shortPassages": retriever.passages(packed.short),
+        "contextMs": result.contextMs + ms(started),
+    })
+
+
 def term_bigrams(text: str) -> set[str]:
     return {term[index:index + 2] for term in tokens(text) for index in range(len(term) - 1)}
 
@@ -771,6 +802,8 @@ async def lifespan(app: FastAPI):
             "discovery_uncovered_only": os.environ.get("KNOT_HYBRID_DISCOVERY_UNCOVERED_ONLY") == "true",
             "discovery_excerpt_tokens": int(os.environ.get("KNOT_HYBRID_DISCOVERY_EXCERPT_TOKENS", "96")),
             "discovery_existing_first": os.environ.get("KNOT_HYBRID_DISCOVERY_EXISTING_FIRST") == "true",
+            "meeting_evidence_first": os.environ.get("KNOT_HYBRID_MEETING_EVIDENCE_FIRST") == "true",
+            "meeting_evidence_reclaim": int(os.environ.get("KNOT_HYBRID_MEETING_EVIDENCE_RECLAIM", "0")),
         })
     elif os.environ.get("KNOT_HYBRID_EVIDENCE_SELECTION") == "true":
         app.state.worker_settings = EVIDENCE_SELECTION_SETTINGS
@@ -828,7 +861,11 @@ def rank(data: RankRequest, request: Request) -> RankResponse:
         keyword, vector = retriever.rank_sources(data.question, embedding, allowed, wide)
         candidates = retriever.fuse_candidates(keyword[:settings.keyword_depth], vector[:settings.vector_depth], settings)
         baseline = retriever.with_context(data, candidates, state.reranker, state.rerank_lock, state.embed_lock, settings)
-        return retriever.discover(data.question, keyword, vector, candidates, baseline, state.reranker,
-                                  state.rerank_lock, state.embed_lock, settings)
+        result = retriever.discover(data.question, keyword, vector, candidates, baseline, state.reranker,
+                                    state.rerank_lock, state.embed_lock, settings)
+        if settings.meeting_evidence_first:
+            with state.embed_lock:
+                return pack_meeting_evidence(data.question, result, retriever, settings)
+        return result
     candidates = retriever.rank(data.question, embedding, data.allowedDocumentIds, settings, data.preferredDocumentId)
     return retriever.with_context(data, candidates, state.reranker, state.rerank_lock, state.embed_lock, settings)

@@ -3,6 +3,7 @@ from unittest import TestCase
 
 from build_dataset import SourceDoc
 from evidence_expansion import expand_evidence
+from meeting_evidence import reserve_meeting_evidence
 from phase1 import Hit
 from phase3 import CONTEXT_BUDGET, Context, assemble, assemble_worker_context, complete_excerpt_boundaries
 from phase4_retrieval import RankRequest, RankResponse, RetrievalSettings, Retriever, prefer_source_text
@@ -45,6 +46,27 @@ class WorkerContextTest(TestCase):
 
         self.assertEqual(baseline.passages, result.passages)
         self.assertEqual([2], [passage.documentId for passage in result.discoveryPassages])
+
+    def test_meeting_evidence_trades_unrelated_edge_for_status_at_fixed_budget(self):
+        fringe = "기타 " * 16 + "."
+        original = "결제 승인 절차 " * 16 + "."
+        target = "결제 승인 기준은 미정이다."
+        body = f"{fringe}\n{original}\n{target}"
+        source = {1: document(1, body), 2: document(2, target)}
+        existing = Hit(documentId=1, field="body", start=0, end=len(fringe) + 1 + len(original))
+        passage = Context(hit=existing, tokenCount=existing.end)
+
+        def tokenizer(text: str, **_options: bool) -> dict[str, list[str]]:
+            return {"input_ids": list(text)}
+
+        result = reserve_meeting_evidence(
+            "결제 승인 기준?", (passage,), (), source, tokenizer, budget=existing.end, reclaim=len(fringe) + 1,
+        )
+        self.assertEqual([1], [item.hit.documentId for item in result.passages])
+        self.assertEqual(original, body[result.passages[0].hit.start:result.passages[0].hit.end].strip())
+        self.assertEqual([1], [item.hit.documentId for item in result.short])
+        self.assertEqual(target, body[result.short[0].hit.start:result.short[0].hit.end])
+        self.assertLessEqual(sum(item.tokenCount for item in (*result.passages, *result.short)), existing.end)
 
     def test_reserved_short_passage_selects_a_separate_excerpt_from_a_selected_document(self):
         original = "회의 시작"
