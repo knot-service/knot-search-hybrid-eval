@@ -423,6 +423,7 @@ class SearchHybridDatasetReplayTest {
                                 workerProperties.getConcurrency(),
                                 workerProperties.getLookupConcurrency(),
                                 workerProperties.isSplitGenerationRoutes(),
+                                workerProperties.isShareGenerationSlots(),
                                 workerProperties.getStreamConcurrency(),
                                 workerProperties.getPollInterval()
                                         .toMillis(),
@@ -549,6 +550,7 @@ class SearchHybridDatasetReplayTest {
             int workerConcurrency,
             int lookupConcurrency,
             boolean splitGenerationRoutes,
+            boolean shareGenerationSlots,
             int streamConcurrency,
             long pollIntervalMs,
             List<LoadObservation> requests
