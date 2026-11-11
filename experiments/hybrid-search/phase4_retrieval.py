@@ -28,6 +28,7 @@ from phase3 import (
     CONTEXT_BUDGET, CONTEXT_COUNT, RERANKER, RERANKER_REVISION, Context,
     adjacent_paragraphs, assemble_worker_context, complete_excerpt_boundaries, material,
 )
+from same_document_evidence import extend_same_document
 
 BODY_SCORE_MARGIN = 1.0
 WEAK_SCORE_GAP = 6.25
@@ -72,6 +73,7 @@ class RetrievalSettings(Frozen):
     expansion_supports_per_meeting: int = 2
     expansion_compact: bool = False
     expansion_order: Literal["rank", "documents"] = "rank"
+    same_document_tokens: int = Field(default=0, ge=0, le=768)
 
 
 BASELINE = RetrievalSettings()
@@ -339,6 +341,12 @@ class Retriever:
                     supports_per_meeting=settings.expansion_supports_per_meeting,
                     compact=settings.expansion_compact, order=settings.expansion_order,
                 )
+                if settings.same_document_tokens:
+                    excerpts = extend_same_document(
+                        request.question, (*contexts, *supports), self.source, self.tokenizer,
+                        budget=settings.expansion_budget, max_added=settings.same_document_tokens,
+                    )
+                    contexts, supports = excerpts[:len(contexts)], excerpts[len(contexts):]
         return RankResponse(documentIds=document_ids, passages=self.passages(contexts),
                             supportingPassages=self.passages(supports),
                             rerankMs=rerank_ms, contextMs=ms(started))
@@ -618,7 +626,10 @@ async def lifespan(app: FastAPI):
         budget = int(os.environ.get("KNOT_SEARCH_HYBRID_EVIDENCE_EXPANSION_BUDGET", minimum_budget))
         if not minimum_budget <= budget <= MAX_EXPANSION_BUDGET:
             raise ValueError(f"Hybrid evidence expansion budget must be between {minimum_budget} and {MAX_EXPANSION_BUDGET}")
-        app.state.worker_settings = EVIDENCE_EXPANSION_SETTINGS.model_copy(update={"expansion_budget": budget})
+        app.state.worker_settings = RetrievalSettings.model_validate({
+            **EVIDENCE_EXPANSION_SETTINGS.model_dump(), "expansion_budget": budget,
+            "same_document_tokens": int(os.environ.get("KNOT_HYBRID_SAME_DOCUMENT_EVIDENCE_TOKENS", "0")),
+        })
     elif os.environ.get("KNOT_HYBRID_EVIDENCE_SELECTION") == "true":
         app.state.worker_settings = EVIDENCE_SELECTION_SETTINGS
     elif os.environ.get("KNOT_HYBRID_PROTECTED_SUPPORT") == "true":

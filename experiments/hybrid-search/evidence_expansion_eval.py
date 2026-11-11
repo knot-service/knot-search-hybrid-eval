@@ -11,6 +11,7 @@ import phase4_retrieval as retrieval
 from accuracy_eval import FIND, SYNTHESIS, SYNTHETIC_SPANS, Replay, span_match, synthetic_match
 from evidence_expansion import expand_evidence
 from phase3 import adjacent_paragraphs
+from same_document_evidence import extend_same_document
 
 VARIANTS = {
     "control": {},
@@ -28,6 +29,10 @@ VARIANTS = {
     "5120 7 slots 220": dict(budget=5120, excerpt_tokens=220, passages_per_kind=7, supports_per_meeting=3),
     "6144 7 slots 220": dict(budget=6144, excerpt_tokens=220, passages_per_kind=7, supports_per_meeting=3),
 }
+for limit in (120, 220, 384, 512, 768):
+    VARIANTS[f"4096 same document +{limit}"] = {
+        **VARIANTS["4096 7 slots 220"], "same_document_tokens": limit,
+    }
 
 
 def positions(passages):
@@ -69,10 +74,17 @@ def audit_case(replay, workspace, case, request, observation):
     passages = {"control": actual}
     for name, config in VARIANTS.items():
         if config:
+            expansion = {key: value for key, value in config.items() if key != "same_document_tokens"}
             expanded, extra = expand_evidence(
-                question, primary, support, candidates, retriever.source, retriever.tokenizer, **config,
+                question, primary, support, candidates, retriever.source, retriever.tokenizer, **expansion,
             )
-            passages[name] = [p.model_dump() for p in retriever.passages((*expanded, *extra))]
+            excerpts = (*expanded, *extra)
+            if max_added := config.get("same_document_tokens"):
+                excerpts = extend_same_document(
+                    question, excerpts, retriever.source, retriever.tokenizer,
+                    budget=config["budget"], max_added=max_added,
+                )
+            passages[name] = [p.model_dump() for p in retriever.passages(excerpts)]
     return passages, (("search", windows(keyword + vector)), ("fusion", windows(candidates)), ("selection", selected))
 
 

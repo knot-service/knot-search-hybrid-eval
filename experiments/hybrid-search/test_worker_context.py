@@ -6,6 +6,7 @@ from evidence_expansion import expand_evidence
 from phase1 import Hit
 from phase3 import CONTEXT_BUDGET, Context, assemble, assemble_worker_context, complete_excerpt_boundaries
 from phase4_retrieval import RankRequest, RetrievalSettings, Retriever, prefer_source_text
+from same_document_evidence import extend_same_document
 
 
 def document(doc_id: int, body: str) -> SourceDoc:
@@ -18,6 +19,25 @@ def character_offsets(text: str, **_options) -> dict:
 
 
 class WorkerContextTest(TestCase):
+    def test_same_document_extension_keeps_original_excerpt_and_fits_spare_budget(self):
+        original = "첫 회의 내용"
+        relevant = "결제 승인 기준은 영수증 확인이다."
+        body = original + "\n" + relevant + "\n별도 회의의 운영 일정을 길게 기록한다."
+        source = {1: document(1, body), 2: document(2, relevant)}
+        hit = Hit(documentId=1, field="body", start=0, end=len(original))
+        passages = (Context(hit=hit, tokenCount=len(original)),)
+
+        def tokenizer(text, **_options):
+            return {"input_ids": list(text)}
+
+        expected = original + "\n" + relevant
+        expanded = extend_same_document(
+            "결제 승인 기준은?", passages, source, tokenizer, budget=50, max_added=len(relevant) + 1,
+        )
+
+        self.assertEqual((Context(hit=hit.model_copy(update={"end": len(expected)}), tokenCount=len(expected)),),
+                         expanded)
+
     def test_expansion_keeps_original_evidence_and_only_adds_from_selected_meetings(self):
         source = {doc: document(doc, "가" * 60).model_copy(update={"meetingId": meeting})
                   for doc, meeting in ((1, 10), (2, 10), (3, 10), (4, 20))}
