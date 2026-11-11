@@ -62,7 +62,8 @@ class SearchAnswerWorkerIntentTest {
                 beans.getBeanProvider(SearchAnswerGenerator.class),
                 Clock.systemUTC(),
                 new SearchAgentProperties(),
-                beans.getBeanProvider(SearchIntentClassifier.class)
+                beans.getBeanProvider(SearchIntentClassifier.class),
+                beans.getBeanProvider(SearchHybridWorkflow.class)
         );
         when(executions.claim(5)).thenReturn(
                 Optional.of(

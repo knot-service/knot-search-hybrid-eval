@@ -1147,7 +1147,8 @@ class SearchDocumentToolServiceIntegrationTest {
                     adapters.getBeanProvider(SearchAnswerGenerator.class),
                     clock,
                     properties,
-                    adapters.getBeanProvider(SearchIntentClassifier.class)
+                    adapters.getBeanProvider(SearchIntentClassifier.class),
+                    adapters.getBeanProvider(SearchHybridWorkflow.class)
             );
             SearchQuestionAcceptedResult accepted = intake.acceptFirst(
                     workspaceId,

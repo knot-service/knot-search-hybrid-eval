@@ -26,6 +26,7 @@ import java.util.concurrent.CancellationException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.support.StaticListableBeanFactory;
 
 @org.junit.jupiter.api.extension.ExtendWith(org.mockito.junit.jupiter.MockitoExtension.class)
 class SearchAnswerWorkerLoggingTest {
@@ -249,7 +250,8 @@ class SearchAnswerWorkerLoggingTest {
                 generators,
                 clock,
                 new SearchAgentProperties(),
-                classifiers
+                classifiers,
+                new StaticListableBeanFactory().getBeanProvider(SearchHybridWorkflow.class)
         );
     }
 }

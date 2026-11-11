@@ -1,6 +1,7 @@
 package com.knot.backend.search.application;
 
 import com.knot.backend.global.logging.ServerErrorLogger;
+import com.knot.backend.search.application.SearchHybridQuestion.Route;
 import com.knot.backend.search.application.dto.result.SearchAnswerWorkResult;
 import com.knot.backend.search.application.dto.result.SearchDocumentResult;
 import com.knot.backend.search.application.dto.result.SearchRetrievalResult;
@@ -26,6 +27,7 @@ import org.springframework.transaction.annotation.Transactional;
 @RequiredArgsConstructor
 @Slf4j
 public class SearchAnswerWorker {
+    private static final int DOCUMENT_LINK_LIMIT = 3;
     private static final String NO_DOCUMENT_GUIDANCE = "현재 검색 가능한 회의 문서에서는 해당 내용을 확인하지 못했습니다. 내용을 녹음하고 문서 준비가 끝난 뒤 다시 질문해 주세요.";
 
     private final SearchAnswerExecutionService executions;
@@ -34,6 +36,7 @@ public class SearchAnswerWorker {
     private final Clock clock;
     private final SearchAgentProperties agentProperties;
     private final ObjectProvider<SearchIntentClassifier> classifiers;
+    private final ObjectProvider<SearchHybridWorkflow> hybridWorkflows;
 
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void execute(long answerId) {
@@ -99,6 +102,18 @@ public class SearchAnswerWorker {
                 startedAt,
                 startedAt.plus(agentProperties.getBudget())
         );
+        SearchHybridWorkflow hybrid = hybridWorkflows.getIfAvailable();
+        if (hybrid != null && hybrid.enabledFor(scope.workspaceId())) {
+            SearchHybridWorkflow.Result result = hybrid.retrieve(scope, work.question());
+            log.info(
+                    "Hybrid search workspaceId={} answerId={} route={} questionMs={} retrievalMs={} candidates={}",
+                    work.workspaceId(), work.answerId(), result.route(), result.questionNanos() / 1_000_000,
+                    result.retrievalNanos() / 1_000_000, result.documents().size()
+            );
+            deliver(work, scope, new SearchRetrievalResult(result.documents(), 0),
+                    result.route() == Route.DOCUMENT_FIND, persistenceCount, persistenceNanos);
+            return;
+        }
         long classificationStarted = System.nanoTime();
         SearchIntent intent;
         try {
@@ -166,6 +181,17 @@ public class SearchAnswerWorker {
             );
             throw exception;
         }
+        deliver(work, scope, retrieval, false, persistenceCount, persistenceNanos);
+    }
+
+    private void deliver(
+            SearchAnswerWorkResult work,
+            SearchToolScope scope,
+            SearchRetrievalResult retrieval,
+            boolean documentFind,
+            AtomicLong persistenceCount,
+            AtomicLong persistenceNanos
+    ) {
         if (!executions.recordRetrieval(
                 work.answerId(),
                 work.token(),
@@ -188,6 +214,16 @@ public class SearchAnswerWorker {
                     List.of(),
                     Set.of()
             );
+            return;
+        }
+        if (documentFind) {
+            List<SearchDocumentResult> linked = documents.stream().limit(DOCUMENT_LINK_LIMIT).toList();
+            List<Long> ids = linked.stream().map(SearchDocumentResult::documentId).toList();
+            String titles = linked.stream()
+                    .map(document -> "- " + document.title().replaceAll("\\R", " "))
+                    .collect(Collectors.joining("\n"));
+            append(work, titles, persistenceCount, persistenceNanos);
+            executions.complete(work.answerId(), work.token(), ids, Set.copyOf(ids));
             return;
         }
         SearchAnswerGenerator generator = generators.getObject();
