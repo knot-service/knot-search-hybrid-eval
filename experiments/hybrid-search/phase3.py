@@ -142,12 +142,13 @@ def assemble(
 def assemble_worker_context(
     hits: tuple[Hit, ...], source: dict[int, SourceDoc],
     tokenizer: PreTrainedTokenizerFast, limits: dict[Hit, int], *,
-    budget: int = CONTEXT_BUDGET, focus: str = "",
+    budget: int = CONTEXT_BUDGET, focus: str = "", extents: dict[Hit, Hit] | None = None,
 ) -> tuple[Context, ...]:
+    extents = extents or {}
     windows = []
     for hit in hits[:CONTEXT_COUNT]:
         doc = source[hit.documentId]
-        extent = adjacent_paragraphs(doc, hit)
+        extent = extents[hit] if hit in extents else adjacent_paragraphs(doc, hit)
         offsets = tokenizer(
             material(doc, extent)[extent.start:extent.end], add_special_tokens=False,
             return_offsets_mapping=True, verbose=False,

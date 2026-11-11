@@ -3,7 +3,7 @@ from unittest import TestCase
 from build_dataset import SourceDoc
 from phase1 import Hit
 from phase3 import CONTEXT_BUDGET, assemble, assemble_worker_context
-from phase4_retrieval import Retriever, prefer_source_text
+from phase4_retrieval import RetrievalSettings, Retriever, prefer_source_text
 
 
 def document(doc_id: int, body: str) -> SourceDoc:
@@ -16,6 +16,37 @@ def character_offsets(text: str, **_options) -> dict:
 
 
 class WorkerContextTest(TestCase):
+    def test_representative_can_change_document_without_changing_the_selected_meetings(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.source = {
+            1: document(1, "시스템 운영 지표 검토"),
+            2: document(2, "결제 취소 승인 기준").model_copy(update={"meetingId": 1}),
+            3: document(3, "분기 예산 검토"),
+            4: document(4, "결제 취소 승인 기준"),
+        }
+        hits = tuple(Hit(documentId=i, field="body", start=0, end=len(doc.body))
+                     for i, doc in retriever.source.items())
+        first, alternate, second, outside = hits
+        picked = retriever.choose_representatives(
+            "결제 취소 승인 기준", (first, second), hits,
+            {first: 5.0, alternate: 4.8, second: 5.0, outside: 10.0},
+            RetrievalSettings(representative_lexical_bonus=3.0),
+        )
+
+        self.assertEqual((alternate, second), picked)
+
+    def test_a_wider_source_window_preserves_one_contiguous_passage(self):
+        body = "가" * 20 + "\n\n" + "나" * 20
+        hit = Hit(documentId=1, field="body", start=0, end=20)
+        extent = hit.model_copy(update={"end": len(body)})
+        contexts = assemble_worker_context(
+            (hit,), {1: document(1, body)}, character_offsets, {},
+            budget=len(body), extents={hit: extent},
+        )
+
+        self.assertEqual((extent,), tuple(context.hit for context in contexts))
+        self.assertEqual(len(body), contexts[0].tokenCount)
+
     def test_spare_slots_add_at_most_one_document_from_each_selected_meeting(self):
         retriever = Retriever.__new__(Retriever)
         retriever.source = {i: document(i, "가" * 40) for i in range(1, 7)}

@@ -35,6 +35,11 @@ class RetrievalSettings(Frozen):
     supplement: Literal["none", "document", "chunk", "both"] = "none"
     supplement_overlap_penalty: float = 0.0
     reuse_spare_slots: bool = False
+    representative_body_bonus: float = 0.0
+    representative_lexical_bonus: float = 0.0
+    representative_rrf_bonus: float = 0.0
+    representatives_only_when_full: bool = True
+    expand_source_window: bool = False
     keyword_depth: int = DEPTH
     vector_depth: int = DEPTH
     fusion_depth: int | None = DEPTH
@@ -45,13 +50,21 @@ class RetrievalSettings(Frozen):
 
 
 BASELINE = RetrievalSettings()
-WORKER_SETTINGS = RetrievalSettings(
+SPARE_SLOT_SETTINGS = RetrievalSettings(
     supplement="both",
     supplement_overlap_penalty=1.0,
     keyword_depth=40,
     context_budget=2048,
     sentence_focus=True,
 )
+EXPANDED_REPRESENTATIVE_SETTINGS = SPARE_SLOT_SETTINGS.model_copy(update={
+    "representative_body_bonus": 1.0,
+    "representative_lexical_bonus": 24.0,
+    "representative_rrf_bonus": 1.0,
+    "representatives_only_when_full": False,
+    "expand_source_window": True,
+    "context_budget": 3072,
+})
 
 
 class RankRequest(Frozen):
@@ -141,6 +154,11 @@ class Retriever:
         else:
             selected = self.by_document(ranked)
         selected = prefer_source_text(selected, ranked, relevance)
+        if request.contextMode == "synthesis" and (
+            not settings.representatives_only_when_full or len(selected) == CONTEXT_COUNT
+        ) and (settings.representative_body_bonus or settings.representative_lexical_bonus
+               or settings.representative_rrf_bonus):
+            selected = self.choose_representatives(request.question, selected, candidates, relevance, settings)
         if request.contextMode == "synthesis" and settings.supplement != "none":
             selected = self.supplement(selected, ranked, settings.supplement, relevance,
                                        overlap_penalty=settings.supplement_overlap_penalty,
@@ -150,10 +168,21 @@ class Retriever:
         best = relevance[ranked[0]]
         limits = {hit: settings.weak_passage_tokens for hit in selected
                   if settings.weak_passage_tokens is not None and best >= 0 and best - relevance[hit] > WEAK_SCORE_GAP}
+        extents = {}
+        if settings.expand_source_window:
+            for hit in selected:
+                siblings = tuple(candidate for candidate in ranked if candidate.documentId == hit.documentId
+                                 and candidate.field == hit.field)
+                if len(siblings) > 1:
+                    combined = hit.model_copy(update={
+                        "start": min(item.start for item in siblings),
+                        "end": max(item.end for item in siblings),
+                    })
+                    extents[hit] = adjacent_paragraphs(self.source[hit.documentId], combined)
         with tokenizer_lock:
             contexts = assemble_worker_context(
                 selected, self.source, self.tokenizer, limits, budget=settings.context_budget,
-                focus=request.question if settings.sentence_focus else "",
+                focus=request.question if settings.sentence_focus else "", extents=extents,
             )
         passages = tuple(Passage(**item.hit.model_dump(), tokenCount=item.tokenCount,
                                  quote=material(self.source[item.hit.documentId], item.hit)[item.hit.start:item.hit.end])
@@ -183,6 +212,42 @@ class Retriever:
             meetings.sort(key=recorded, reverse=True)
             meetings = meetings[:recent]
         return tuple(meetings[:CONTEXT_COUNT])
+
+    def choose_representatives(
+        self, question: str, representatives: tuple[Hit, ...], candidates: tuple[Hit, ...],
+        relevance: dict[Hit, float], settings: RetrievalSettings,
+    ) -> tuple[Hit, ...]:
+        options: dict[int, list[Hit]] = {}
+        for hit in candidates:
+            options.setdefault(self.source[hit.documentId].meetingId, []).append(hit)
+        lexical = (self.representative_lexical_scores(question, candidates)
+                   if settings.representative_lexical_bonus else {})
+        rrf_weight = {hit: 3 / (3 + index) for index, hit in enumerate(candidates)}
+
+        def priority(hit: Hit) -> float:
+            return (relevance[hit] + settings.representative_body_bonus * (hit.field == "body")
+                    + settings.representative_lexical_bonus * lexical.get(hit, 0.0)
+                    + settings.representative_rrf_bonus * rrf_weight[hit])
+
+        return tuple(max((representative, *options[self.source[representative.documentId].meetingId]),
+                         key=priority) for representative in representatives)
+
+    def representative_lexical_scores(self, question: str, ranked: tuple[Hit, ...]) -> dict[Hit, float]:
+        query = term_bigrams(question)
+        if not query:
+            return {}
+        matches = {}
+        for hit in ranked:
+            doc = self.source[hit.documentId]
+            window = adjacent_paragraphs(doc, hit)
+            title = query & term_bigrams(doc.title)
+            excerpt = query & term_bigrams(material(doc, window)[window.start:window.end])
+            matches[hit] = title, excerpt
+        weights = {term: 1 / (1 + sum(term in title or term in excerpt for title, excerpt in matches.values()))
+                   for term in query}
+        total = sum(weights.values())
+        return {hit: (sum(weights[term] for term in title) + sum(weights[term] for term in excerpt)) / total
+                for hit, (title, excerpt) in matches.items()}
 
     def supplement(self, representatives: tuple[Hit, ...], ranked: tuple[Hit, ...],
                    mode: Literal["document", "chunk", "both"], relevance: dict[Hit, float], *,
@@ -229,6 +294,10 @@ class Retriever:
         return tuple(selected)
 
 
+def term_bigrams(text: str) -> set[str]:
+    return {term[index:index + 2] for term in tokens(text) for index in range(len(term) - 1)}
+
+
 def passage_terms(document: SourceDoc, hit: Hit) -> set[tuple[str, ...]]:
     window = adjacent_paragraphs(document, hit)
     terms = tokens(material(document, window)[window.start:window.end])
@@ -263,6 +332,10 @@ def prefer_source_text(selected: tuple[Hit, ...], ranked: tuple[Hit, ...],
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     torch.set_num_threads(4)
+    app.state.worker_settings = (
+        EXPANDED_REPRESENTATIVE_SETTINGS
+        if os.environ.get("KNOT_HYBRID_EXPAND_CONTEXT") == "true" else SPARE_SLOT_SETTINGS
+    )
     model = SentenceTransformer(MODEL, revision=REVISION, device="cpu")
     app.state.retrievers = {workspace: Retriever(model, workspace) for workspace in (1, 458)}
     model.encode(["query: 워밍업"], normalize_embeddings=True, show_progress_bar=False)
@@ -299,7 +372,7 @@ def rank(data: RankRequest, request: Request) -> RankResponse:
         query = request.app.state.model.encode([f"query: {data.question}"], normalize_embeddings=True,
                                                show_progress_bar=False)[0]
     retriever = request.app.state.retrievers[data.workspaceId]
-    settings = BASELINE if data.contextMode == "none" else WORKER_SETTINGS
+    settings = BASELINE if data.contextMode == "none" else request.app.state.worker_settings
     candidates = retriever.rank(data.question, vector_literal(query.tolist()), data.allowedDocumentIds, settings)
     return retriever.with_context(data, candidates, request.app.state.reranker, request.app.state.rerank_lock,
                                   request.app.state.embed_lock, settings)
