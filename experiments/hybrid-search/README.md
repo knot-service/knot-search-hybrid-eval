@@ -417,3 +417,53 @@ python phase6_qwen.py --generation-routes phase6-generation-routes-false phase6-
 순서는 공용 → 고정 분리 → 슬롯 공유다. 동시 6건에서 내용 질문 Worker 대기 p95는 5.257 → 4.895 → 0.096초였다. 종합 대기 p95는 3.668 → 5.988 → 4.559초였다. Worker 로그에서 내용 질문과 종합 각각 두 작업이 동시에 생성 슬롯을 사용한 경우를 12회씩 확인했다. 세 설정 각각 108/108건이 완료됐고, 문서 찾기 36건씩 생성·분류 호출은 모두 0회였다. 경로당 표본은 12·24건이므로 p99는 관측 최댓값이다.
 
 Workspace 458에서 기대 회의를 모두 최종 인용한 답변은 31/36 → 36/36 → 36/36건, 원문·저장 출처 일치 인용은 50/50 → 62/62 → 68/68개였다. S18-01은 세 설정 모두 기대 문서가 문맥에 6/6건 포함됐고, 최종 인용은 1/6 → 6/6 → 6/6건이었다. 슬롯 공유에서 공용 대비 기대 회의가 검색 문맥에서 줄어든 사례는 0/36건이었다.
+
+### 6차 후속: 오래 기다린 회의 종합 우선 처리
+
+`SEARCH_SYNTHESIS_PROMOTION_WAIT=2s`로 실험했다. 슬롯 공유를 켠 상태에서만 사용하며 기본값 `0s`는 기존 내용 질문 우선 정책이다. 기준 이상 기다린 회의 종합을 가장 오래 기다린 순서로 먼저 시작하고, 남은 슬롯은 내용 질문과 일반 종합 순서로 사용한다. 이미 시작한 생성은 중단하지 않으므로 2초는 우선순위가 바뀌는 기준이고 완료나 시작을 보장하는 상한은 아니다. 문서 찾기와 하이브리드 대상 밖의 기존 작업은 승격하지 않는다. 접수나 재시도에서 종합 대기 시작 시각을 저장한다. 마이그레이션 전에 큐에 있던 행은 재시도 시점부터 적용한다.
+
+균등 부하는 직전 내용 질문 우선 결과와 같은 동시 3·6건을 비교한다. 내용 질문 집중 부하는 최대 6건씩 12회 반복한다. 각 회차에서 내용 질문 2건을 바로 보낸 뒤 300ms에 회의 종합과 문서 찾기를 각 1건, 800ms와 1,200ms에 내용 질문을 1건씩 더 보낸다. 다음 회차는 앞 회차 SSE가 끝난 뒤 시작한다. 집중 부하의 두 설정은 모두 새로 측정한다. 두 부하 모두 생성 슬롯 2개, 문서 찾기 슬롯 1개, Worker 폴링 100ms를 사용한다. 로그에서 실제 실행을 시작한 승격 건수를 응답 ID로 확인한다.
+
+5차 검색 서비스와 기존 LLM·Docker 환경을 준비한 뒤 저장소 루트에서 실행한다.
+
+```sh
+root="$PWD"
+local_dir="$root/experiments/hybrid-search/.local"
+cd "$root/backend"
+for scenario in surge-before surge-after balanced-after; do
+  case "$scenario" in
+    surge-before) pattern=question_surge; wait_limit=0s ;;
+    surge-after) pattern=question_surge; wait_limit=2s ;;
+    balanced-after) pattern=balanced; wait_limit=2s ;;
+  esac
+  run_dir="$local_dir/phase6-aging-$scenario"
+  mkdir -p -m 700 "$run_dir"
+  cp -p "$local_dir/phase5-fixtures.json" "$run_dir/phase5-fixtures.json"
+  KNOT_PHASE5_FIXTURES="$run_dir/phase5-fixtures.json" KNOT_PHASE6_LOAD=true KNOT_PHASE6_WAVES=12 \
+    KNOT_PHASE6_LOAD_PATTERN="$pattern" SEARCH_LOOKUP_WORKER_CONCURRENCY=1 \
+    SEARCH_SPLIT_GENERATION_ROUTES=true SEARCH_SHARE_GENERATION_SLOTS=true \
+    SEARCH_SYNTHESIS_PROMOTION_WAIT="$wait_limit" \
+    ./gradlew integrationTest --rerun --tests '*SearchHybridDatasetReplayTest.measuresMixedConcurrentSse' || exit 1
+  install -m 600 build/test-results/integrationTest/TEST-com.knot.backend.search.application.SearchHybridDatasetReplayTest.xml "$run_dir/worker.xml"
+done
+cd "$root/experiments/hybrid-search"
+python phase6_aging.py phase6-generation-slots-priority phase6-aging-balanced-after phase6-aging-surge-before phase6-aging-surge-after
+```
+
+Lab에는 집계만 담은 `phase6-aging-comparison.json`을 게시한다.
+
+| 부하 | 경로 | Worker 대기 p95/p99 (초) | 첫 SSE p95/p99 (초) | 완료 p95/p99 (초) |
+| --- | --- | ---: | ---: | ---: |
+| 균등 3건 | 문서 찾기 | 0.088/0.088 → 0.107/0.107 | 0.246/0.246 → 0.262/0.262 | 0.267/0.267 → 0.262/0.262 |
+| 균등 3건 | 내용 질문 | 0.089/0.089 → 0.108/0.108 | 4.153/4.153 → 5.540/5.540 | 4.153/4.153 → 5.540/5.540 |
+| 균등 3건 | 회의 종합 | 0.105/0.105 → 0.108/0.108 | 5.476/5.476 → 8.577/8.577 | 5.590/5.590 → 8.577/8.577 |
+| 균등 6건 | 문서 찾기 | 0.257/0.275 → 0.262/0.284 | 0.371/0.461 → 0.370/0.460 | 0.371/0.461 → 0.461/0.462 |
+| 균등 6건 | 내용 질문 | 0.096/0.105 → 3.886/6.608 | 4.581/4.638 → 7.219/9.482 | 4.581/4.638 → 7.219/9.482 |
+| 균등 6건 | 회의 종합 | 4.559/4.587 → 4.964/4.970 | 8.859/8.921 → 9.655/11.835 | 8.859/8.921 → 9.767/11.835 |
+| 집중 6건 | 문서 찾기 | 0.100/0.100 → 0.105/0.105 | 0.240/0.240 → 0.299/0.299 | 0.241/0.241 → 0.299/0.299 |
+| 집중 6건 | 내용 질문 | 1.605/2.312 → 3.567/4.433 | 5.770/6.194 → 8.009/8.742 | 5.880/6.194 → 8.010/8.742 |
+| 집중 6건 | 회의 종합 | 5.050/5.050 → 2.871/2.871 | 8.935/8.935 → 7.475/7.475 | 8.935/8.935 → 7.475/7.475 |
+
+순서는 내용 질문 우선 → 종합 2초 승격이다. 집중 부하에서 승격한 종합은 12/12건이었다. 종합이 마지막 내용 질문보다 먼저 시작한 회차는 0/12 → 12/12회였고, Worker 대기 p95는 5.050 → 2.871초였다. 내용 질문의 대기 p95는 1.605 → 3.567초였다. 균등 3건에서는 승격이 없었고, 균등 6건에서는 종합 24건 중 21건을 승격했다. 균등 6건의 종합 대기 p95는 4.559 → 4.964초로 줄지 않았다. 각 경로의 p99는 이 표본에서 관측 최댓값이다.
+
+정책마다 총 180/180건이 완료됐고, 문서 찾기 48건의 생성·분류 호출은 각각 0회였다. Workspace 458에서 기대 회의가 줄어든 검색 문맥은 균등 0/36, 집중 0/30건이었다. 기대 회의를 모두 인용한 답변은 균등 36/36 → 32/36건, 집중 28/30 → 30/30건이었다. 누락은 모두 S18-01이었다. 해당 문서의 최종 인용은 균등 6/6 → 2/6건, 집중 0/2 → 2/2건이었으며 검색 문맥에는 모든 사례에서 기대 문서가 있었다. 표시 인용은 균등 68/68 → 52/52개, 집중 32/32 → 50/50개가 원문과 저장 출처에 일치했다. 모델·프롬프트와 검증 방식은 같은 별도 실행이므로 인용률 차이를 승격의 효과로 단정할 수 없다.

@@ -275,6 +275,10 @@ class SearchHybridDatasetReplayTest {
                 1,
                 100
         );
+        String loadPattern = System.getenv().getOrDefault("KNOT_PHASE6_LOAD_PATTERN", "balanced");
+        assertThat(loadPattern).isIn("balanced", "question_surge");
+        boolean surge = loadPattern.equals("question_surge");
+        List<Integer> levels = surge ? List.of(6) : List.of(3, 6);
         List<LoadSample> samples = new ArrayList<>();
         try (HttpClient http = HttpClient.newHttpClient()) {
             List<LoadQuestion> warmup = questions(
@@ -293,24 +297,13 @@ class SearchHybridDatasetReplayTest {
             assertThat(warmed).allMatch(sample -> sample.completedNanos() != null);
             clearInvocations(llm);
             observed.clear();
-            for (int concurrency : List.of(
-                    3,
-                    6
-            )) {
+            for (int concurrency : levels) {
                 for (int wave = 0; wave < waves; wave++) {
-                    List<LoadQuestion> questions = questions(
-                            dataset,
-                            concurrency,
-                            wave
-                    );
-                    var events = SearchHybridLoadReplay.wave(
-                            http,
-                            mapper,
-                            requests(
-                                    questions,
-                                    members
-                            )
-                    );
+                    List<LoadQuestion> questions = surge ? surgeQuestions(dataset, wave) : questions(dataset, concurrency, wave);
+                    List<HttpRequest> batch = requests(questions, members);
+                    var events = surge
+                            ? SearchHybridLoadReplay.wave(http, mapper, batch, List.of(0L, 0L, 300L, 300L, 800L, 1200L))
+                            : SearchHybridLoadReplay.wave(http, mapper, batch);
                     for (int index = 0; index < events.size(); index++) {
                         samples.add(
                                 new LoadSample(
@@ -424,6 +417,8 @@ class SearchHybridDatasetReplayTest {
                                 workerProperties.getLookupConcurrency(),
                                 workerProperties.isSplitGenerationRoutes(),
                                 workerProperties.isShareGenerationSlots(),
+                                workerProperties.getSynthesisPromotionWait().toMillis(),
+                                loadPattern,
                                 workerProperties.getStreamConcurrency(),
                                 workerProperties.getPollInterval()
                                         .toMillis(),
@@ -435,7 +430,7 @@ class SearchHybridDatasetReplayTest {
                 output,
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING
         );
-        assertThat(results).hasSize(9 * waves);
+        assertThat(results).hasSize(levels.stream().mapToInt(Integer::intValue).sum() * waves);
         assertThat(results).allSatisfy(row -> {
             assertThat(row.questionOnly()).isEqualTo(workerProperties.isSplitGenerationRoutes()
                     && row.expectedRoute() == Route.MEETING_QUESTION);
@@ -468,27 +463,28 @@ class SearchHybridDatasetReplayTest {
         for (int index = 0; index < concurrency; index++) {
             int occurrence = wave * (concurrency / routes.size()) + index / routes.size();
             int routeIndex = index % routes.size();
-            Workspace workspace = dataset.workspaces()
-                    .get(
-                            (occurrence + routeIndex) % dataset.workspaces()
-                                    .size()
-                    );
-            List<EvalCase> cohort = workspace.cases()
-                    .stream()
-                    .filter(item -> item.live() && item.route() == routes.get(routeIndex))
-                    .toList();
-            EvalCase selected = cohort.get(
-                    (occurrence / dataset.workspaces()
-                            .size()) % cohort.size()
-            );
-            questions.add(
-                    new LoadQuestion(
-                            workspace.id(),
-                            selected
-                    )
-            );
+            questions.add(loadQuestion(dataset, routes.get(routeIndex), occurrence, routeIndex));
         }
         return questions;
+    }
+
+    private List<LoadQuestion> surgeQuestions(Dataset dataset, int wave) {
+        int offset = wave * 4;
+        return List.of(
+                loadQuestion(dataset, Route.MEETING_QUESTION, offset, 1),
+                loadQuestion(dataset, Route.MEETING_QUESTION, offset + 1, 1),
+                loadQuestion(dataset, Route.MULTI_MEETING_SYNTHESIS, wave, 2),
+                loadQuestion(dataset, Route.DOCUMENT_FIND, wave, 0),
+                loadQuestion(dataset, Route.MEETING_QUESTION, offset + 2, 1),
+                loadQuestion(dataset, Route.MEETING_QUESTION, offset + 3, 1));
+    }
+
+    private LoadQuestion loadQuestion(Dataset dataset, Route route, int occurrence, int routeOffset) {
+        int workspaceCount = dataset.workspaces().size();
+        Workspace workspace = dataset.workspaces().get((occurrence + routeOffset) % workspaceCount);
+        List<EvalCase> cohort = workspace.cases().stream()
+                .filter(item -> item.live() && item.route() == route).toList();
+        return new LoadQuestion(workspace.id(), cohort.get((occurrence / workspaceCount) % cohort.size()));
     }
 
     private List<HttpRequest> requests(
@@ -551,6 +547,8 @@ class SearchHybridDatasetReplayTest {
             int lookupConcurrency,
             boolean splitGenerationRoutes,
             boolean shareGenerationSlots,
+            long synthesisPromotionWaitMs,
+            String loadPattern,
             int streamConcurrency,
             long pollIntervalMs,
             List<LoadObservation> requests

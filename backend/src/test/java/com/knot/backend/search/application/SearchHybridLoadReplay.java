@@ -5,6 +5,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -20,14 +21,28 @@ final class SearchHybridLoadReplay {
             ObjectMapper mapper,
             List<HttpRequest> requests
     ) throws Exception {
+        return wave(http, mapper, requests, Collections.nCopies(requests.size(), 0L));
+    }
+
+    static List<Sample> wave(
+            HttpClient http,
+            ObjectMapper mapper,
+            List<HttpRequest> requests,
+            List<Long> dispatchDelayMs
+    ) throws Exception {
         CountDownLatch ready = new CountDownLatch(requests.size());
         CountDownLatch start = new CountDownLatch(1);
         try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
             List<Future<Sample>> results = new ArrayList<>();
-            for (HttpRequest request : requests) {
+            for (int index = 0; index < requests.size(); index++) {
+                HttpRequest request = requests.get(index);
+                long delay = dispatchDelayMs.get(index);
                 results.add(executor.submit(() -> {
                     ready.countDown();
                     start.await();
+                    if (delay > 0) {
+                        Thread.sleep(delay);
+                    }
                     return read(
                             http,
                             mapper,
