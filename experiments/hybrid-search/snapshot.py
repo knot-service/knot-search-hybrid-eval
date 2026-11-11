@@ -80,5 +80,34 @@ def export(separate_path: Path) -> None:
     print(f"documents={len(documents)} cases={len(cases)} sha256={hashlib.sha256(encoded).hexdigest()}")
 
 
+def export_reference() -> None:
+    sql = """
+    begin read only;
+    select json_agg(json_build_object(
+        'scenario', c->>'scenario', 'category', c->>'category',
+        'expectedType', c->>'expectedType', 'question', c->>'question',
+        'expectedBehavior', c->>'expectedBehavior'
+    ) order by c->>'id')
+    from eval_state,jsonb_array_elements(data->'datasets') d,jsonb_array_elements(d->'cases') c
+    where d->>'id'='knot-workspace-458' and d->>'version'='1.30'
+      and d->>'locked'='true' and c->>'id' like '%-01';
+    commit;
+    """
+    result = read_local_db("knot-eval-isolated-postgres-1", "knot_eval", sql)
+    rows = json.loads(result)
+    if not rows:
+        raise SystemExit("The locked v1.30 reference has no canonical scenarios.")
+    target = ROOT / ".local" / "v130-reference.json"
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_bytes(result)
+    temporary.chmod(0o600)
+    temporary.replace(target)
+    print(f"v1.30 scenario references={len(rows)}")
+
+
 if __name__ == "__main__":
-    export(Path(sys.argv[1]))
+    if sys.argv[1] == "--v130-reference":
+        export_reference()
+    else:
+        export(Path(sys.argv[1]))
