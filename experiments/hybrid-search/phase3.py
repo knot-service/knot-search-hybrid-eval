@@ -101,11 +101,12 @@ def adjacent_paragraphs(doc: SourceDoc, hit: Hit) -> Hit:
 
 def assemble(
     hits: tuple[Hit, ...], source: dict[int, SourceDoc],
-    tokenizer: PreTrainedTokenizerFast, *, expand: bool,
+    tokenizer: PreTrainedTokenizerFast, *, expand: bool, balanced: bool = False,
 ) -> tuple[Context, ...]:
     contexts: list[Context] = []
     remaining = CONTEXT_BUDGET
-    for hit in hits[:CONTEXT_COUNT]:
+    selected = hits[:CONTEXT_COUNT]
+    for index, hit in enumerate(selected):
         doc = source[hit.documentId]
         extent = adjacent_paragraphs(doc, hit) if expand else hit
         if any(item.hit.documentId == extent.documentId and item.hit.field == extent.field
@@ -115,11 +116,21 @@ def assemble(
         offsets: list[tuple[int, int]] = tokenizer(
             text[extent.start:extent.end], add_special_tokens=False, return_offsets_mapping=True, verbose=False,
         )["offset_mapping"]
-        taken = min(remaining, len(offsets))
+        budget = remaining
+        if balanced:
+            budget //= len(selected) - index
+            # Give each meeting a share of the budget. Keep its matching child ahead of extra context.
+            child_start = next((i for i, (_, end) in enumerate(offsets)
+                                if extent.start + end > hit.start), 0)
+            if len(offsets) > budget and child_start > 0:
+                skip = min(child_start, len(offsets) - budget)
+                offsets = offsets[skip:]
+        taken = min(budget, len(offsets))
         if taken == 0:
             continue
-        if taken < len(offsets):
-            extent = extent.model_copy(update={"end": extent.start + offsets[taken - 1][1]})
+        if balanced or taken < len(offsets):
+            start = extent.start + offsets[0][0] if balanced else extent.start
+            extent = extent.model_copy(update={"start": start, "end": extent.start + offsets[taken - 1][1]})
         contexts.append(Context(hit=extent, tokenCount=taken))
         remaining -= taken
         if remaining == 0:
@@ -129,7 +140,7 @@ def assemble(
 
 def quality(
     case: DraftCase, hits: tuple[Hit, ...], source: dict[int, SourceDoc],
-    tokenizer: PreTrainedTokenizerFast, *, expand: bool,
+    tokenizer: PreTrainedTokenizerFast, *, expand: bool, balanced: bool = False,
 ) -> Quality:
     start = perf_counter()
     context = assemble(hits, source, tokenizer, expand=expand)

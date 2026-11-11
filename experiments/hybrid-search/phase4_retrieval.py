@@ -1,5 +1,7 @@
-"""Loopback-only retrieval adapter for the Spring Boot phase 4 experiment."""
+"""Loopback-only scoped retrieval and evidence selection for the Spring Worker."""
 from contextlib import asynccontextmanager
+from datetime import datetime
+from time import perf_counter
 from threading import Lock
 from typing import Literal
 
@@ -7,7 +9,7 @@ import torch
 from fastapi import FastAPI, Request
 from pydantic import Field
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from transformers import PreTrainedTokenizerFast
 
@@ -15,17 +17,28 @@ from build_dataset import Frozen, documents
 from database import connect, vector_literal
 from experiment import MODEL, REVISION, tokens
 from phase1 import Hit, chunks, prepare
-from phase2 import DEPTH, fuse
+from phase2 import DEPTH, fuse, ms
+from phase3 import CONTEXT_COUNT, RERANKER, RERANKER_REVISION, assemble, material
 
 
 class RankRequest(Frozen):
     workspaceId: Literal[1, 458]
     question: str = Field(min_length=1, max_length=4000)
     allowedDocumentIds: tuple[int, ...] = Field(max_length=10_000)
+    contextMode: Literal["none", "question", "synthesis"] = "none"
+    recentMeetings: int = Field(default=0, ge=0, le=10)
+
+
+class Passage(Hit):
+    quote: str
+    tokenCount: int
 
 
 class RankResponse(Frozen):
     documentIds: tuple[int, ...]
+    passages: tuple[Passage, ...] = ()
+    rerankMs: float = 0
+    contextMs: float = 0
 
 
 class Retriever:
@@ -37,6 +50,8 @@ class Retriever:
         if not isinstance(tokenizer, PreTrainedTokenizerFast):
             raise RuntimeError("The embedding tokenizer must return character offsets.")
         units = tuple(child for doc in source for child in chunks(doc, "fixed", tokenizer))
+        self.source = {doc.id: doc for doc in source}
+        self.tokenizer = tokenizer
         self.hits = tuple(Hit(documentId=child.documentId, field=child.field,
                               start=child.start, end=child.end) for child in units)
         self.keyword = BM25Okapi([tokens(child.text) for child in units])
@@ -50,7 +65,7 @@ class Retriever:
             if existing != set(self.hits):
                 prepare(db, source, model, workspace_id=workspace_id, modes=("fixed",))
 
-    def rank(self, question: str, embedding: str, allowed_ids: tuple[int, ...]) -> RankResponse:
+    def rank(self, question: str, embedding: str, allowed_ids: tuple[int, ...]) -> tuple[Hit, ...]:
         allowed = set(allowed_ids)
         with connect() as db:
             vector = tuple(Hit(documentId=doc, field=field, start=left, end=right)
@@ -63,7 +78,57 @@ class Retriever:
         scores = self.keyword.get_scores(tokens(question))
         matching = (i for i, hit in enumerate(self.hits) if hit.documentId in allowed and scores[i] > 0)
         keyword = tuple(self.hits[i] for i in sorted(matching, key=lambda i: (-scores[i], i))[:DEPTH])
-        return RankResponse(documentIds=tuple(dict.fromkeys(hit.documentId for hit in fuse(keyword, vector))))
+        return fuse(keyword, vector)
+
+    def with_context(self, request: RankRequest, candidates: tuple[Hit, ...],
+                     reranker: CrossEncoder, rerank_lock: Lock, tokenizer_lock: Lock) -> RankResponse:
+        document_ids = tuple(dict.fromkeys(hit.documentId for hit in candidates))
+        if request.contextMode == "none" or not candidates:
+            return RankResponse(documentIds=document_ids)
+
+        pairs = [(request.question, f"{self.source[hit.documentId].title}\n"
+                  f"{material(self.source[hit.documentId], hit)[hit.start:hit.end]}") for hit in candidates]
+        started = perf_counter()
+        with rerank_lock:
+            scores = reranker.predict(pairs, batch_size=10, show_progress_bar=False)
+        ranked = tuple(hit for hit, _ in sorted(zip(candidates, scores, strict=True),
+                                                key=lambda entry: -float(entry[1])))
+        rerank_ms = ms(started)
+        started = perf_counter()
+        if request.contextMode == "synthesis":
+            selected = self.by_meeting(ranked, request.recentMeetings)
+        else:
+            selected = self.by_document(ranked)
+        with tokenizer_lock:
+            contexts = assemble(selected, self.source, self.tokenizer, expand=True, balanced=True)
+        passages = tuple(Passage(**item.hit.model_dump(), tokenCount=item.tokenCount,
+                                 quote=material(self.source[item.hit.documentId], item.hit)[item.hit.start:item.hit.end])
+                         for item in contexts)
+        return RankResponse(documentIds=document_ids, passages=passages,
+                            rerankMs=rerank_ms, contextMs=ms(started))
+
+    @staticmethod
+    def by_document(ranked: tuple[Hit, ...]) -> tuple[Hit, ...]:
+        by_document: dict[int, Hit] = {}
+        for hit in ranked:
+            by_document.setdefault(hit.documentId, hit)
+        selected = tuple(by_document.values())[:CONTEXT_COUNT - 1]
+        others = (hit for hit in ranked if hit not in selected)
+        return (*selected, *others)[:CONTEXT_COUNT]
+
+    def by_meeting(self, ranked: tuple[Hit, ...], recent: int) -> tuple[Hit, ...]:
+        by_meeting: dict[int, Hit] = {}
+        for hit in ranked:
+            by_meeting.setdefault(self.source[hit.documentId].meetingId, hit)
+        meetings = list(by_meeting.values())
+
+        def recorded(hit: Hit) -> datetime:
+            return datetime.fromisoformat(self.source[hit.documentId].recordedAt)
+
+        if recent:
+            meetings.sort(key=recorded, reverse=True)
+            meetings = meetings[:recent]
+        return tuple(meetings[:CONTEXT_COUNT])
 
 
 @asynccontextmanager
@@ -74,6 +139,10 @@ async def lifespan(app: FastAPI):
     model.encode(["query: 워밍업"], normalize_embeddings=True, show_progress_bar=False)
     app.state.model = model
     app.state.embed_lock = Lock()
+    app.state.reranker = CrossEncoder(RERANKER, revision=RERANKER_REVISION, max_length=384,
+                                      device="cpu", trust_remote_code=False)
+    app.state.reranker.predict([("워밍업", "검색 예시")], show_progress_bar=False)
+    app.state.rerank_lock = Lock()
     yield
 
 
@@ -89,4 +158,6 @@ def rank(data: RankRequest, request: Request) -> RankResponse:
         query = request.app.state.model.encode([f"query: {data.question}"], normalize_embeddings=True,
                                                show_progress_bar=False)[0]
     retriever = request.app.state.retrievers[data.workspaceId]
-    return retriever.rank(data.question, vector_literal(query.tolist()), data.allowedDocumentIds)
+    candidates = retriever.rank(data.question, vector_literal(query.tolist()), data.allowedDocumentIds)
+    return retriever.with_context(data, candidates, request.app.state.reranker, request.app.state.rerank_lock,
+                                  request.app.state.embed_lock)
