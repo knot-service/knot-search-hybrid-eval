@@ -189,6 +189,37 @@ def assemble_worker_context(
     return tuple(contexts)
 
 
+def complete_excerpt_boundaries(contexts: tuple[Context, ...], supports: tuple[Context, ...],
+                                source: dict[int, SourceDoc], tokenizer: PreTrainedTokenizerFast,
+                                budget: int, max_extension: int) -> tuple[tuple[Context, ...], tuple[Context, ...]]:
+    remaining = budget - sum(item.tokenCount for item in (*contexts, *supports))
+    extended = []
+    for item in (*contexts, *supports):
+        hit = item.hit
+        text = material(source[hit.documentId], hit)
+        if remaining and hit.field == "body":
+            start, end = hit.start, hit.end
+            boundaries = [0, *(match.end() for match in re.finditer(r"\n+|[.!?。！？](?=\s|$)", text)), len(text)]
+            left = max(boundary for boundary in boundaries if boundary <= start)
+            right = min(boundary for boundary in boundaries if boundary >= end)
+            for next_start, next_end in ((start, right), (left, right), (left, end)):
+                while next_start < start and text[next_start].isspace():
+                    next_start += 1
+                next_end = end + len(text[end:next_end].rstrip())
+                if (next_start, next_end) == (start, end):
+                    continue
+                count = len(tokenizer(text[next_start:next_end], add_special_tokens=False,
+                                      verbose=False)["input_ids"])
+                added = max(0, count - item.tokenCount)
+                if added <= min(remaining, max_extension):
+                    item = Context(hit=hit.model_copy(update={"start": next_start, "end": next_end}),
+                                   tokenCount=max(item.tokenCount, count))
+                    remaining -= added
+                    break
+        extended.append(item)
+    return tuple(extended[:len(contexts)]), tuple(extended[len(contexts):])
+
+
 def focused_start(text: str, offsets: list[tuple[int, int]], taken: int, question: str, fallback: int) -> int:
     terms = set(tokens(question))
     boundaries = [0, *(m.end() for m in re.finditer(r"\n+|[.!?。！？](?=\s|$)", text)), len(text)]

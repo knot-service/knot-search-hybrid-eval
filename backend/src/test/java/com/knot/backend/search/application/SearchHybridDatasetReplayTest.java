@@ -613,10 +613,8 @@ class SearchHybridDatasetReplayTest {
             long member
     ) {
         List<Observation> rows = new ArrayList<>();
-        // A claimed execution supplies the same authorization as a real Worker. Batch
-        // by lease.
-        for (int offset = 0; offset < workspace.cases()
-                .size(); offset += 100) {
+        for (EvalCase item : workspace.cases()) {
+            // Match the lifetime of an individual Worker request during offline replay.
             SearchAnswerWorkResult work = transaction.execute(
                     status -> executions.claim(
                             intake.acceptFirst(
@@ -637,37 +635,26 @@ class SearchHybridDatasetReplayTest {
                     started,
                     started.plusSeconds(120)
             );
-            int until = Math.min(
-                    offset + 100,
-                    workspace.cases()
-                            .size()
+            SearchHybridWorkflow.Result result = hybrid.retrieve(
+                    scope,
+                    item.question()
             );
-            for (EvalCase item : workspace.cases()
-                    .subList(
-                            offset,
-                            until
-                    )) {
-                SearchHybridWorkflow.Result result = hybrid.retrieve(
-                        scope,
-                        item.question()
-                );
-                rows.add(
-                        new Observation(
-                                workspace.id(),
-                                workspace.version(),
-                                item.id(),
-                                item.route(),
-                                result.route(),
-                                item.expectedIds(),
-                                ids(result),
-                                result.questionNanos(),
-                                result.retrievalNanos(),
-                                result.passages(),
-                                result.rerankMs(),
-                                result.contextMs()
-                        )
-                );
-            }
+            rows.add(
+                    new Observation(
+                            workspace.id(),
+                            workspace.version(),
+                            item.id(),
+                            item.route(),
+                            result.route(),
+                            item.expectedIds(),
+                            ids(result),
+                            result.questionNanos(),
+                            result.retrievalNanos(),
+                            result.passages(),
+                            result.rerankMs(),
+                            result.contextMs()
+                    )
+            );
             executions.append(
                     work.answerId(),
                     work.token(),

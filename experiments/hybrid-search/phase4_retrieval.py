@@ -1,12 +1,14 @@
 """Loopback-only scoped retrieval and evidence selection for the Spring Worker."""
+from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from hashlib import sha256
 import os
 from pathlib import Path
-from time import perf_counter
 from threading import Lock
+from time import perf_counter
 from typing import Callable, Literal
+from zoneinfo import ZoneInfo
 
 import torch
 from fastapi import FastAPI, Request
@@ -19,16 +21,18 @@ from transformers import PreTrainedTokenizerFast
 from build_dataset import Frozen, SourceDoc, documents
 from database import connect, vector_literal
 from experiment import MODEL, REVISION, tokens
+from evidence_expansion import expand_evidence
 from phase1 import Hit, chunks, prepare
 from phase2 import DEPTH, fuse, ms
 from phase3 import (
     CONTEXT_BUDGET, CONTEXT_COUNT, RERANKER, RERANKER_REVISION, Context,
-    adjacent_paragraphs, assemble_worker_context, material,
+    adjacent_paragraphs, assemble_worker_context, complete_excerpt_boundaries, material,
 )
 
 BODY_SCORE_MARGIN = 1.0
 WEAK_SCORE_GAP = 6.25
 WEAK_PASSAGE_TOKENS = 96
+KOREA = ZoneInfo("Asia/Seoul")
 
 
 class RetrievalSettings(Frozen):
@@ -56,6 +60,17 @@ class RetrievalSettings(Frozen):
     context_budget: int = CONTEXT_BUDGET
     weak_passage_tokens: int | None = WEAK_PASSAGE_TOKENS
     sentence_focus: bool = False
+    complementary_bonus: float = 0
+    spare_evidence: Literal["none", "chunk", "document", "both"] = "none"
+    boundary_tokens: int = 0
+    supplemental_candidates: int = 0
+    late_fusion: bool = False
+    expansion_budget: int = 0
+    expansion_excerpt_tokens: int = 160
+    expansion_slots: int = 5
+    expansion_supports_per_meeting: int = 2
+    expansion_compact: bool = False
+    expansion_order: Literal["rank", "documents"] = "rank"
 
 
 BASELINE = RetrievalSettings()
@@ -83,6 +98,20 @@ SUPPORTING_SELECTION_SETTINGS = SUPPORTING_DOCUMENT_SETTINGS.model_copy(update={
     "supporting_extra_per_meeting": True,
 })
 PROTECTED_SUPPORT_SETTINGS = SUPPORTING_SELECTION_SETTINGS.model_copy(update={"extra_support_rrf_bonus": 5.0})
+EVIDENCE_SELECTION_SETTINGS = PROTECTED_SUPPORT_SETTINGS.model_copy(update={
+    "complementary_bonus": 8.0,
+    "spare_evidence": "chunk",
+    "boundary_tokens": 24,
+    "supplemental_candidates": 4,
+    "late_fusion": True,
+})
+
+EVIDENCE_EXPANSION_SETTINGS = EVIDENCE_SELECTION_SETTINGS.model_copy(update={
+    "expansion_budget": 3072,
+    "expansion_excerpt_tokens": 220,
+    "expansion_slots": 7,
+    "expansion_supports_per_meeting": 3,
+})
 
 
 class RankRequest(Frozen):
@@ -91,6 +120,8 @@ class RankRequest(Frozen):
     allowedDocumentIds: tuple[int, ...] = Field(max_length=10_000)
     contextMode: Literal["none", "question", "synthesis"] = "none"
     recentMeetings: int = Field(default=0, ge=0, le=10)
+    preferredDocumentId: int | None = Field(default=None, gt=0)
+    inferredComparisonDays: tuple[date, ...] = Field(default=(), max_length=2)
 
 
 class Passage(Hit):
@@ -131,9 +162,35 @@ class Retriever:
                 prepare(db, source, model, workspace_id=workspace_id, modes=("fixed",))
 
     def rank(self, question: str, embedding: str, allowed_ids: tuple[int, ...],
-             settings: RetrievalSettings = BASELINE) -> tuple[Hit, ...]:
+             settings: RetrievalSettings = BASELINE,
+             preferred_document_id: int | None = None) -> tuple[Hit, ...]:
+        if preferred_document_id in allowed_ids:
+            allowed_ids = (preferred_document_id,)
         keyword, vector = self.rank_sources(question, embedding, allowed_ids, settings)
-        return fuse(keyword, vector, settings.fusion_depth, settings.fusion_reserve)
+        return self.fuse_candidates(keyword, vector, settings)
+
+    def fuse_candidates(self, keyword: tuple[Hit, ...], vector: tuple[Hit, ...],
+                        settings: RetrievalSettings) -> tuple[Hit, ...]:
+        fused = fuse(keyword, vector, settings.fusion_depth, settings.fusion_reserve)
+        if not settings.supplemental_candidates or settings.fusion_depth is None:
+            return fused
+        meeting_counts = Counter(self.source[hit.documentId].meetingId for hit in fused)
+        documents = {hit.documentId for hit in fused}
+        extras = []
+        for hit in fuse(keyword, vector, None):
+            meeting = self.source[hit.documentId].meetingId
+            if settings.late_fusion:
+                if hit in fused or hit.field != "body":
+                    continue
+            elif meeting_counts[meeting] > 1 or hit.documentId in documents:
+                continue
+            if hit not in fused:
+                extras.append(hit)
+                documents.add(hit.documentId)
+                meeting_counts[meeting] += 1
+                if len(extras) == settings.supplemental_candidates:
+                    break
+        return (*fused, *extras)
 
     def rank_sources(self, question: str, embedding: str, allowed_ids: tuple[int, ...],
                      settings: RetrievalSettings) -> tuple[tuple[Hit, ...], tuple[Hit, ...]]:
@@ -160,26 +217,31 @@ class Retriever:
         if request.contextMode == "none" or not candidates:
             return RankResponse(documentIds=document_ids)
 
+        first_pass = candidates[:settings.fusion_depth] if settings.late_fusion else candidates
         pairs = [(request.question, f"{self.source[hit.documentId].title}\n"
-                  f"{material(self.source[hit.documentId], hit)[hit.start:hit.end]}") for hit in candidates]
+                  f"{material(self.source[hit.documentId], hit)[hit.start:hit.end]}") for hit in first_pass]
         started = perf_counter()
         with rerank_lock:
             scores = reranker.predict(pairs, batch_size=10, show_progress_bar=False)
-        relevance = dict(zip(candidates, map(float, scores), strict=True))
-        ranked = tuple(sorted(candidates, key=lambda hit: -relevance[hit]))
+        relevance = dict(zip(first_pass, map(float, scores), strict=True))
+        ranked = tuple(sorted(first_pass, key=lambda hit: -relevance[hit]))
         rerank_ms = ms(started)
         started = perf_counter()
-        if request.contextMode == "synthesis":
+        synthesis = request.contextMode == "synthesis"
+        selected = self.by_document(ranked) if not synthesis or request.inferredComparisonDays else ()
+        if synthesis and request.inferredComparisonDays:
+            covered_days = {datetime.fromisoformat(self.source[hit.documentId].recordedAt).astimezone(KOREA).date()
+                            for hit in selected}
+            synthesis = not set(request.inferredComparisonDays).issubset(covered_days)
+        if synthesis:
             selected = self.by_meeting(ranked, request.recentMeetings)
-        else:
-            selected = self.by_document(ranked)
         selected = prefer_source_text(selected, ranked, relevance)
-        if request.contextMode == "synthesis" and (
+        if synthesis and (
             not settings.representatives_only_when_full or len(selected) == CONTEXT_COUNT
         ) and (settings.representative_body_bonus or settings.representative_lexical_bonus
                or settings.representative_rrf_bonus):
-            selected = self.choose_representatives(request.question, selected, candidates, relevance, settings)
-        if request.contextMode == "synthesis" and settings.supplement != "none":
+            selected = self.choose_representatives(request.question, selected, first_pass, relevance, settings)
+        if synthesis and settings.supplement != "none":
             selected = self.supplement(selected, ranked, settings.supplement, relevance,
                                        overlap_penalty=settings.supplement_overlap_penalty,
                                        reuse_spare_slots=settings.reuse_spare_slots)
@@ -216,7 +278,7 @@ class Retriever:
                 extras = ()
                 if support_budget:
                     extras = self.supporting_documents(
-                        request.question, primary_hits, ranked, candidates, relevance, settings,
+                        request.question, primary_hits, ranked, first_pass, relevance, settings,
                         per_meeting=2 if settings.supporting_shared_slots else 1,
                     )
                     extra_settings = settings
@@ -226,7 +288,7 @@ class Retriever:
                     reserved = 0
                     if can_add_support and settings.extra_support_reserve_tokens:
                         reserve_candidates = self.supporting_documents(
-                            request.question, (*primary_hits, *extras), ranked, candidates, relevance, extra_settings,
+                            request.question, (*primary_hits, *extras), ranked, first_pass, relevance, extra_settings,
                         )[:CONTEXT_COUNT - len(extras)]
                         reserved = min(len(reserve_candidates) * settings.extra_support_reserve_tokens, support_budget // 3)
                     supports = assemble_worker_context(
@@ -239,7 +301,7 @@ class Retriever:
                     if can_add_support and spare and len(supports) < CONTEXT_COUNT:
                         extras_after = self.supporting_documents(
                             request.question, (*primary_hits, *(item.hit for item in supports)),
-                            ranked, candidates, relevance, extra_settings,
+                            ranked, first_pass, relevance, extra_settings,
                         )[:CONTEXT_COUNT - len(supports)]
                         supports += assemble_worker_context(
                             extras_after, self.source, self.tokenizer,
@@ -254,9 +316,111 @@ class Retriever:
                         )
                 if on_supporting is not None:
                     on_supporting(primary_hits, extras, support_budget)
+            if settings.spare_evidence != "none":
+                contexts, supports = self.add_spare_evidence(
+                    request.question, contexts, supports, ranked, relevance, settings,
+                )
+            if settings.late_fusion:
+                fallback = candidates[len(first_pass):]
+                fallback_scores = {hit: -index for index, hit in enumerate(fallback)}
+                contexts, supports = self.use_fusion_fallback(
+                    request.question, contexts, supports, fallback, fallback_scores, settings,
+                )
+            if settings.boundary_tokens:
+                contexts, supports = complete_excerpt_boundaries(
+                    contexts, supports, self.source, self.tokenizer, settings.context_budget, settings.boundary_tokens,
+                )
+            if settings.expansion_budget:
+                contexts, supports = expand_evidence(
+                    request.question, contexts, supports, candidates, self.source, self.tokenizer,
+                    budget=settings.expansion_budget, excerpt_tokens=settings.expansion_excerpt_tokens,
+                    passages_per_kind=settings.expansion_slots,
+                    supports_per_meeting=settings.expansion_supports_per_meeting,
+                    compact=settings.expansion_compact, order=settings.expansion_order,
+                )
         return RankResponse(documentIds=document_ids, passages=self.passages(contexts),
                             supportingPassages=self.passages(supports),
                             rerankMs=rerank_ms, contextMs=ms(started))
+
+    def use_fusion_fallback(self, question: str, contexts: tuple[Context, ...], supports: tuple[Context, ...],
+                            candidates: tuple[Hit, ...], relevance: dict[Hit, float],
+                            settings: RetrievalSettings) -> tuple[tuple[Context, ...], tuple[Context, ...]]:
+        existing = (*contexts, *supports)
+        spare = min(220, settings.context_budget - sum(item.tokenCount for item in existing))
+        if spare < 32:
+            return contexts, supports
+        for hit in sorted(candidates, key=relevance.__getitem__, reverse=True):
+            for index, item in enumerate(existing):
+                original = item.hit
+                if (hit.documentId != original.documentId or hit.field != original.field
+                        or not original.start <= hit.start < original.end < hit.end):
+                    continue
+                text = material(self.source[hit.documentId], hit)
+                tail = self.tokenizer(text[original.end:hit.end], add_special_tokens=False,
+                                      return_offsets_mapping=True, verbose=False)["offset_mapping"]
+                if not tail:
+                    continue
+                end = original.end + tail[min(spare, len(tail)) - 1][1]
+                count = len(self.tokenizer(text[original.start:end], add_special_tokens=False,
+                                           verbose=False)["input_ids"])
+                if count > item.tokenCount + spare:
+                    continue
+                extended = Context(hit=original.model_copy(update={"end": end}),
+                                   tokenCount=max(count, item.tokenCount))
+                updated = (*existing[:index], extended, *existing[index + 1:])
+                return updated[:len(contexts)], updated[len(contexts):]
+        return self.add_spare_evidence(question, contexts, supports, candidates, relevance,
+                                       settings.model_copy(update={"spare_evidence": "both"}))
+
+    def add_spare_evidence(self, question: str, contexts: tuple[Context, ...], supports: tuple[Context, ...],
+                           ranked: tuple[Hit, ...], relevance: dict[Hit, float],
+                           settings: RetrievalSettings) -> tuple[tuple[Context, ...], tuple[Context, ...]]:
+        remaining = settings.context_budget - sum(item.tokenCount for item in (*contexts, *supports))
+        if remaining < 32 or not contexts:
+            return contexts, supports
+        primary = {item.hit.documentId for item in contexts}
+        meetings = {self.source[doc].meetingId for doc in primary}
+        support_docs = {item.hit.documentId for item in supports}
+        counts = Counter(self.source[doc].meetingId for doc in support_docs)
+        existing = tuple(item.hit for item in (*contexts, *supports))
+        eligible = []
+        for hit in ranked:
+            doc = hit.documentId
+            meeting = self.source[doc].meetingId
+            same_doc = doc in primary and settings.spare_evidence in ("chunk", "both") \
+                and len(contexts) < CONTEXT_COUNT
+            other_doc = doc not in primary and doc not in support_docs and meeting in meetings \
+                and counts[meeting] < 2 and settings.spare_evidence in ("document", "both") \
+                and len(supports) < CONTEXT_COUNT
+            if hit.field == "body" and (same_doc or other_doc) and not any(
+                hit.documentId == old.documentId and hit.field == old.field
+                and hit.start < old.end and old.start < hit.end for old in existing
+            ):
+                eligible.append(hit)
+        if not eligible:
+            return contexts, supports
+        novelty = self.uncovered_query_terms(question, existing, tuple(eligible))
+        hit = max(eligible, key=lambda h: relevance[h] + 8 * novelty[h])
+        added = assemble_worker_context(
+            (hit,), self.source, self.tokenizer, {}, budget=min(remaining, 220), focus=question,
+        )
+        if hit.documentId in primary:
+            return (*contexts, *added), supports
+        return contexts, (*supports, *added)
+
+    def uncovered_query_terms(self, question: str, selected: tuple[Hit, ...],
+                              candidates: tuple[Hit, ...]) -> dict[Hit, float]:
+        query = term_bigrams(question)
+
+        def matches(hit: Hit) -> set[str]:
+            source = self.source[hit.documentId]
+            return query & term_bigrams(material(source, hit)[hit.start:hit.end])
+
+        seen: dict[int, set[str]] = {}
+        for hit in selected:
+            seen.setdefault(self.source[hit.documentId].meetingId, set()).update(matches(hit))
+        return {hit: len(matches(hit) - seen.get(self.source[hit.documentId].meetingId, set())) / max(1, len(query))
+                for hit in candidates}
 
     def passages(self, contexts: tuple[Context, ...]) -> tuple[Passage, ...]:
         return tuple(Passage(**item.hit.model_dump(), tokenCount=item.tokenCount,
@@ -275,9 +439,11 @@ class Retriever:
         if not eligible:
             return ()
         scores = self.supporting_scores(question, primary, eligible, candidates, relevance, settings)
+        novelty = (self.uncovered_query_terms(question, primary, eligible) if settings.complementary_bonus else {})
         chosen: dict[int, list[Hit]] = {}
         used_documents = set()
-        for hit in sorted(eligible, key=lambda item: sum(scores[item]), reverse=True):
+        for hit in sorted(eligible, key=lambda item: sum(scores[item]) + settings.complementary_bonus * novelty.get(item, 0),
+                          reverse=True):
             if hit.documentId in used_documents:
                 continue
             by_meeting = chosen.setdefault(self.source[hit.documentId].meetingId, [])
@@ -446,7 +612,11 @@ def prefer_source_text(selected: tuple[Hit, ...], ranked: tuple[Hit, ...],
 async def lifespan(app: FastAPI):
     torch.set_num_threads(4)
     app.state.worker_settings = SPARE_SLOT_SETTINGS
-    if os.environ.get("KNOT_HYBRID_PROTECTED_SUPPORT") == "true":
+    if os.environ.get("KNOT_HYBRID_EVIDENCE_EXPANSION") == "true":
+        app.state.worker_settings = EVIDENCE_EXPANSION_SETTINGS
+    elif os.environ.get("KNOT_HYBRID_EVIDENCE_SELECTION") == "true":
+        app.state.worker_settings = EVIDENCE_SELECTION_SETTINGS
+    elif os.environ.get("KNOT_HYBRID_PROTECTED_SUPPORT") == "true":
         app.state.worker_settings = PROTECTED_SUPPORT_SETTINGS
     elif os.environ.get("KNOT_HYBRID_SUPPORTING_SELECTION") == "true":
         app.state.worker_settings = SUPPORTING_SELECTION_SETTINGS
@@ -491,6 +661,7 @@ def rank(data: RankRequest, request: Request) -> RankResponse:
                                                show_progress_bar=False)[0]
     retriever = request.app.state.retrievers[data.workspaceId]
     settings = BASELINE if data.contextMode == "none" else request.app.state.worker_settings
-    candidates = retriever.rank(data.question, vector_literal(query.tolist()), data.allowedDocumentIds, settings)
+    candidates = retriever.rank(data.question, vector_literal(query.tolist()), data.allowedDocumentIds, settings,
+                                data.preferredDocumentId)
     return retriever.with_context(data, candidates, request.app.state.reranker, request.app.state.rerank_lock,
                                   request.app.state.embed_lock, settings)

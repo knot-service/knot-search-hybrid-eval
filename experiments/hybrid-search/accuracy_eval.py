@@ -8,7 +8,8 @@ from pathlib import Path
 from threading import Lock
 
 from phase4_retrieval import (
-    BASELINE, SPARE_SLOT_SETTINGS, SUPPORTING_DOCUMENT_SETTINGS, SUPPORTING_SELECTION_SETTINGS,
+    BASELINE, EVIDENCE_SELECTION_SETTINGS, PROTECTED_SUPPORT_SETTINGS, SPARE_SLOT_SETTINGS,
+    SUPPORTING_DOCUMENT_SETTINGS, SUPPORTING_SELECTION_SETTINGS,
     RankRequest, RetrievalSettings, app, lifespan,
 )
 from phase5_eval import FIND, SYNTHESIS
@@ -62,8 +63,11 @@ class Replay:
 
     @lru_cache(maxsize=None)
     def rank_sources(self, request, keyword_depth, vector_depth):
+        allowed = request.allowedDocumentIds
+        if request.preferredDocumentId in allowed:
+            allowed = (request.preferredDocumentId,)
         return self.state.retrievers[request.workspaceId].rank_sources(
-            request.question, self.embedding(request.question), request.allowedDocumentIds,
+            request.question, self.embedding(request.question), allowed,
             BASELINE.model_copy(update=dict(keyword_depth=keyword_depth, vector_depth=vector_depth)),
         )
 
@@ -86,10 +90,10 @@ class Replay:
                 if request:
                     request = request.model_copy(update={"question": case["question"]})
                     keyword, vector = self.rank_sources(request, settings.keyword_depth, settings.vector_depth)
-                    candidates = fuse(keyword, vector, settings.fusion_depth, settings.fusion_reserve)
                     selected = []
                     support = []
                     retriever = self.state.retrievers[wid]
+                    candidates = retriever.fuse_candidates(keyword, vector, settings)
                     result = retriever.with_context(
                         request, candidates, self.reranker,
                         self.lock, self.lock, settings, on_selected=selected.extend,
@@ -105,7 +109,8 @@ class Replay:
                                                ("selection", selected))
                         }
                     passages = [p.model_dump() for p in (*result.passages, *result.supportingPassages)]
-                    sizes["rerankCandidates"].append(len(candidates))
+                    reranked = candidates[:settings.fusion_depth] if settings.late_fusion else candidates
+                    sizes["rerankCandidates"].append(len(reranked))
                 elif row["retrievalNanos"]:
                     raise ValueError(f"Missing captured scope for {case['id']}")
                 if compare_spring:
@@ -433,9 +438,30 @@ def compare_protected_support(replay, root):
     }, indent=2) + "\n")
 
 
+def compare_evidence_selection(replay, root):
+    base, before = replay.run(PROTECTED_SUPPORT_SETTINGS, "dates")
+    assert (base[1]["matched"], base[458]["matched"]) == (413, 7), base
+    results = []
+    for label, scope, changes in (
+        ("selection", "dates", {"complementary_bonus": 8.0, "spare_evidence": "chunk"}),
+        ("excerpt", "dates", {"boundary_tokens": 24}),
+        ("routing", "four-stage-guarded", {}),
+        ("fusion", "dates", {"supplemental_candidates": 4, "late_fusion": True}),
+        ("combined", "four-stage-guarded", EVIDENCE_SELECTION_SETTINGS.model_dump()),
+    ):
+        config = PROTECTED_SUPPORT_SETTINGS.model_copy(update=changes)
+        stats, spans = replay.run(config, scope)
+        results.append({"stage": label, "stats": stats, **changed_spans(before, spans)})
+        print(label, stats, compare(before, spans), flush=True)
+    (root / "evidence-selection.json").write_text(json.dumps({"baseline": base, "trials": results}, indent=2) + "\n")
+
+
 async def run(root, stage):
     async with lifespan(app):
         replay = Replay(root, app.state)
+        if stage == "evidence-selection":
+            compare_evidence_selection(replay, root)
+            return
         if stage == "protected-support":
             compare_protected_support(replay, root)
             return
@@ -542,7 +568,7 @@ if __name__ == "__main__":
         "selection", "remaining", "followup", "supplement-overlap",
         "meeting-representatives", "meeting-representatives-rrf", "meeting-representatives-refine", "supporting-documents",
         "supporting-selection", "supporting-selection-shared", "supporting-selection-light", "supporting-selection-causes",
-        "protected-support",
+        "protected-support", "evidence-selection",
     ))
     args = parser.parse_args()
     asyncio.run(run(args.root, args.stage))

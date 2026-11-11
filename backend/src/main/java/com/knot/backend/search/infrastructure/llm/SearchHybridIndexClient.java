@@ -35,7 +35,9 @@ public class SearchHybridIndexClient implements AutoCloseable {
             String question,
             List<Long> allowedDocumentIds,
             String contextMode,
-            int recentMeetings
+            int recentMeetings,
+            Long preferredDocumentId,
+            List<String> inferredComparisonDays
     ) {
         HttpRequest request = HttpRequest.newBuilder(endpoint)
                 .timeout(Duration.ofSeconds(10))
@@ -51,7 +53,9 @@ public class SearchHybridIndexClient implements AutoCloseable {
                                                 question,
                                                 allowedDocumentIds,
                                                 contextMode,
-                                                recentMeetings
+                                                recentMeetings,
+                                                preferredDocumentId,
+                                                inferredComparisonDays
                                         )
                                 )
                         )
@@ -94,7 +98,9 @@ public class SearchHybridIndexClient implements AutoCloseable {
             String question,
             List<Long> allowedDocumentIds,
             String contextMode,
-            int recentMeetings
+            int recentMeetings,
+            Long preferredDocumentId,
+            List<String> inferredComparisonDays
     ) {
     }
 

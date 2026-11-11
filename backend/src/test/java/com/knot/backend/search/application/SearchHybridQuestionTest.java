@@ -19,7 +19,10 @@ class SearchHybridQuestionTest {
             "Blue-Green 배포를 선택한 이유를 찾아줘,MEETING_QUESTION,0", "10월 19일 회의 내용으로 확인해 줘,MEETING_QUESTION,0",
             "배포 관련 자료 찾아서 요점 알려줘,MEETING_QUESTION,0", "배포 회의 문서 찾아줘. 결정 여부도 알려줘,MEETING_QUESTION,0",
             "배포 결정을 담은 자료가 뭐야?,DOCUMENT_FIND,0", "최근 세 번의 회의에서 배포 전략이 어떻게 바뀌었어?,MULTI_MEETING_SYNTHESIS,3",
-            "두 소셜 로그인 회의의 결정 차이를 알려줘,MULTI_MEETING_SYNTHESIS,0"})
+            "두 소셜 로그인 회의의 결정 차이를 알려줘,MULTI_MEETING_SYNTHESIS,0",
+            "11월 1일이랑 11월 5일 얘기를 같이 보면 AI를 어떻게 다루기로 한 거야?,MULTI_MEETING_SYNTHESIS,0",
+            "10월 20일이랑 22일에 각각 뭘 먼저 하기로 했는지 비교해 줘.,MULTI_MEETING_SYNTHESIS,0",
+            "문서 277 찾아줘,DOCUMENT_FIND,0"})
     void selectsRoute(
             String question,
             Route route,
@@ -31,6 +34,20 @@ class SearchHybridQuestionTest {
         );
         assertThat(parsed.route()).isEqualTo(route);
         assertThat(parsed.recentMeetings()).isEqualTo(count);
+    }
+
+    @Test
+    void recognizesOnlyAnExplicitSingleDocumentNumber() {
+        assertThat(SearchHybridQuestion.explicitDocumentId("문서 #277에서는 어떻게 정했어?")).isEqualTo(277L);
+        assertThat(SearchHybridQuestion.explicitDocumentId("10월 27일 회의의 자료는?")).isNull();
+        assertThat(SearchHybridQuestion.explicitDocumentId("문서 277과 문서 278의 차이")).isNull();
+        assertThat(SearchHybridQuestion.explicitDocumentId("문서 277건에서 관련 내용을 찾아줘")).isNull();
+    }
+
+    @Test
+    void forwardsTheRequestedDaysWhenDateComparisonDeterminesTheRoute() {
+        var parsed = SearchHybridQuestion.parse("10월 20일이랑 22일에 각각 뭘 먼저 하기로 했는지 비교해 줘.", REFERENCE);
+        assertThat(parsed.inferredComparisonDays()).containsExactly("2026-10-20", "2026-10-22");
     }
 
     @Test

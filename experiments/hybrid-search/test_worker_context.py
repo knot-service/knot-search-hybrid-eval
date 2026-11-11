@@ -2,8 +2,9 @@ from threading import Lock
 from unittest import TestCase
 
 from build_dataset import SourceDoc
+from evidence_expansion import expand_evidence
 from phase1 import Hit
-from phase3 import CONTEXT_BUDGET, assemble, assemble_worker_context
+from phase3 import CONTEXT_BUDGET, Context, assemble, assemble_worker_context, complete_excerpt_boundaries
 from phase4_retrieval import RankRequest, RetrievalSettings, Retriever, prefer_source_text
 
 
@@ -17,6 +18,28 @@ def character_offsets(text: str, **_options) -> dict:
 
 
 class WorkerContextTest(TestCase):
+    def test_expansion_keeps_original_evidence_and_only_adds_from_selected_meetings(self):
+        source = {doc: document(doc, "가" * 60).model_copy(update={"meetingId": meeting})
+                  for doc, meeting in ((1, 10), (2, 10), (3, 10), (4, 20))}
+
+        def tokenizer(text, **options):
+            return {"input_ids": list(text), **character_offsets(text)}
+
+        def hit(doc, start, end):
+            return Hit(documentId=doc, field="body", start=start, end=end)
+
+        primary = (Context(hit=hit(1, 0, 30), tokenCount=30),)
+        support = (Context(hit=hit(2, 0, 30), tokenCount=30),)
+        candidates = (hit(4, 0, 40), hit(1, 20, 50), hit(3, 0, 40))
+        expanded, extra = expand_evidence(
+            "근거", primary, support, candidates, source, tokenizer,
+            budget=120, excerpt_tokens=40, supports_per_meeting=2,
+        )
+        self.assertEqual((Context(hit=hit(1, 0, 50), tokenCount=50),), expanded)
+        self.assertEqual(support, extra[:1])
+        self.assertEqual([2, 3], [item.hit.documentId for item in extra])
+        self.assertEqual(120, sum(item.tokenCount for item in (*expanded, *extra)))
+
     def test_supporting_documents_try_each_meeting_before_a_second_document(self):
         retriever = Retriever.__new__(Retriever)
         retriever.source = {
@@ -183,6 +206,46 @@ class WorkerContextTest(TestCase):
         excerpt = body[contexts[0].hit.start:contexts[0].hit.end]
         self.assertIn("환불 기준은 영업일 7일이다.", excerpt)
         self.assertEqual(26, contexts[0].tokenCount)
+
+    def test_finishes_a_clipped_sentence_without_exceeding_the_shared_budget(self):
+        source = {1: document(1, "결정 안 함. 다음 회의에서 확정.")}
+        hit = Hit(documentId=1, field="body", start=0, end=6)
+        original = Context(hit=hit, tokenCount=6)
+
+        def tokenizer(text, **options):
+            return {"input_ids": list(text)}
+
+        contexts, supports = complete_excerpt_boundaries((original,), (), source, tokenizer, 6, 24)
+        self.assertEqual((original,), contexts)
+        self.assertEqual((), supports)
+        contexts, _ = complete_excerpt_boundaries((original,), (), source, tokenizer, 7, 24)
+        self.assertEqual((0, 7, 7), (contexts[0].hit.start, contexts[0].hit.end, contexts[0].tokenCount))
+
+    def test_fusion_supplement_keeps_original_candidates_and_adds_an_underrepresented_meeting(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.source = {
+            1: document(1, "가"), 2: document(2, "나").model_copy(update={"meetingId": 1}),
+            3: document(3, "다").model_copy(update={"meetingId": 1}), 4: document(4, "라"),
+        }
+        hits = tuple(Hit(documentId=i, field="body", start=0, end=1) for i in (1, 2, 3, 4))
+        settings = RetrievalSettings(fusion_depth=2, supplemental_candidates=1)
+        self.assertEqual((hits[0], hits[1], hits[3]), retriever.fuse_candidates(hits, hits, settings))
+
+    def test_fusion_fallback_extends_an_overlapping_excerpt_without_replacing_it(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.source = {1: document(1, "0123456789" * 10)}
+
+        def tokenizer(text, **options):
+            return {"input_ids": list(text), **character_offsets(text)}
+
+        retriever.tokenizer = tokenizer
+        original = Context(hit=Hit(documentId=1, field="body", start=0, end=40), tokenCount=40)
+        candidate = Hit(documentId=1, field="body", start=30, end=90)
+        contexts, supports = retriever.use_fusion_fallback(
+            "근거", (original,), (), (candidate,), {candidate: 1.0}, RetrievalSettings(context_budget=72),
+        )
+        self.assertEqual((0, 72, 72), (contexts[0].hit.start, contexts[0].hit.end, contexts[0].tokenCount))
+        self.assertEqual((), supports)
 
     def test_uses_short_passages_unused_budget_for_earlier_child(self):
         docs = {i: document(i, "가" * length) for i, length in enumerate((350, 320, 320, 20, 10), 1)}

@@ -6,20 +6,25 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.YearMonth;
 import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.regex.Pattern;
 
 public record SearchHybridQuestion(
         Route route,
         List<DateRange> recordedDates,
-        int recentMeetings
+        int recentMeetings,
+        List<String> inferredComparisonDays
 ) {
     public SearchHybridQuestion {
         recordedDates = List.copyOf(recordedDates);
+        inferredComparisonDays = List.copyOf(inferredComparisonDays);
     }
 
     private static final ZoneId KOREA = ZoneId.of("Asia/Seoul");
-    private static final String DOCUMENT = "(?:회의(?:록|\\s*문서)?|문서|기록|자료|링크|목록)";
+    private static final String NUMBERED_DOCUMENT = "문서\\s*#?\\s*([1-9][0-9]{0,18})(?![0-9]|\\s*(?:건|개|편|종|쪽|페이지))";
+    private static final Pattern DOCUMENT_ID = Pattern.compile(NUMBERED_DOCUMENT);
+    private static final String DOCUMENT = "(?:회의(?:록|\\s*문서)?|(?:" + NUMBERED_DOCUMENT + "|문서)|기록|자료|링크|목록)";
     private static final String REQUEST_END = "\\s*(?:[.!?…]+\\s*)?$";
     private static final Pattern DOCUMENT_REQUEST = Pattern.compile(
             DOCUMENT + "(?:를|을|이|가|은|는|도)?\\s*(?:좀\\s*)?" + "(?:(?:찾아|보여|띄워|열어|검색해)(?:\\s*(?:줘|주세요|줄래|줄 수 있어|주실래요))?"
@@ -38,6 +43,10 @@ public record SearchHybridQuestion(
                     + "|어떻게\\s*(?:바뀌었|달라졌)|(?:부터|까지).{0,20}논의.{0,10}모아"
                     + "|회의들|(?:첫|앞|나중|다음)\\s*회의.{0,32}(?:차이|바꾼|바뀐|비교)" + "|(?:두|세|[2-9])\\s*번.{0,32}각각"
                     + "|\\d{1,2}일.{0,24}\\d{1,2}일.{0,20}(?:회의|발표)"
+    );
+    private static final Pattern COMPARED_DAYS = Pattern.compile(
+            "[0-9]{1,2}일\\s*(?:과|와|이랑|랑|하고|및|,)\\s*(?:[0-9]{1,2}월\\s*)?[0-9]{1,2}일"
+                    + ".{0,40}(?:각각|비교|같이\\s*보|함께\\s*보)"
     );
     private static final Pattern RECENT_MEETINGS = Pattern
             .compile("(?:최근|지난)\\s*(\\d{1,2}|한|두|세|네|다섯)\\s*(?:번|회(?!의)|차례|건)");
@@ -65,12 +74,25 @@ public record SearchHybridQuestion(
                 Normalizer.Form.NFKC
         );
         int count = recentCount(question);
-        return new SearchHybridQuestion(route(question, count), dates(question, reference.atZone(KOREA).toLocalDate()), count);
+        var days = dates(question, reference.atZone(KOREA).toLocalDate());
+        Route initialRoute = baseRoute(question, count);
+        boolean inferred = isInferredDateComparison(question, initialRoute);
+        List<String> comparisonDays = inferred && days.size() == 2 && days.stream()
+                .allMatch(range -> range.from().plus(1, ChronoUnit.DAYS).equals(range.before()))
+                ? days.stream().map(range -> range.from().atZone(KOREA).toLocalDate().toString()).distinct().toList()
+                : List.of();
+        return new SearchHybridQuestion(inferred ? Route.MULTI_MEETING_SYNTHESIS : initialRoute,
+                days, count, comparisonDays);
     }
 
     static Route classifyRoute(String raw) {
         String question = Normalizer.normalize(raw, Normalizer.Form.NFKC);
-        return route(question, recentCount(question));
+        Route initialRoute = baseRoute(question, recentCount(question));
+        return isInferredDateComparison(question, initialRoute) ? Route.MULTI_MEETING_SYNTHESIS : initialRoute;
+    }
+
+    private static boolean isInferredDateComparison(String question, Route initialRoute) {
+        return initialRoute == Route.MEETING_QUESTION && COMPARED_DAYS.matcher(question).find();
     }
 
     private static int recentCount(String question) {
@@ -93,7 +115,7 @@ public record SearchHybridQuestion(
         return DOCUMENT_REQUEST.matcher(Normalizer.normalize(question, Normalizer.Form.NFKC)).find();
     }
 
-    private static Route route(
+    private static Route baseRoute(
             String question,
             int count
     ) {
@@ -107,6 +129,22 @@ public record SearchHybridQuestion(
             return Route.MULTI_MEETING_SYNTHESIS;
         }
         return Route.MEETING_QUESTION;
+    }
+
+    static Long explicitDocumentId(String raw) {
+        var matcher = DOCUMENT_ID.matcher(Normalizer.normalize(raw, Normalizer.Form.NFKC));
+        if (!matcher.find()) {
+            return null;
+        }
+        String id = matcher.group(1);
+        if (matcher.find()) {
+            return null;
+        }
+        try {
+            return Long.valueOf(id);
+        } catch (NumberFormatException outOfRange) {
+            return null;
+        }
     }
 
     private static List<DateRange> dates(

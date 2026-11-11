@@ -40,19 +40,22 @@ public class SearchHybridWorkflow {
     private final SearchDocumentQuery documents;
     private final SearchToolAccess access;
     private final Set<Long> workspaces;
+    private final boolean evidenceExpansion;
 
     public SearchHybridWorkflow(
             SearchHybridIndexClient index,
             SearchHybridDocumentScope documentScope,
             SearchDocumentQuery documents,
             SearchToolAccess access,
-            @Value("${knot.search.hybrid.workspaces:}") Set<Long> workspaces
+            @Value("${knot.search.hybrid.workspaces:}") Set<Long> workspaces,
+            @Value("${knot.search.hybrid.evidence-expansion:false}") boolean evidenceExpansion
     ) {
         this.index = index;
         this.documentScope = documentScope;
         this.documents = documents;
         this.access = access;
         this.workspaces = Set.copyOf(workspaces);
+        this.evidenceExpansion = evidenceExpansion;
     }
 
     public boolean enabledFor(long workspaceId) {
@@ -75,7 +78,9 @@ public class SearchHybridWorkflow {
         );
         long questionNanos = System.nanoTime() - started;
         long retrievalStarted = System.nanoTime();
-        if (eligible.isEmpty()) {
+        Long preferredDocumentId = SearchHybridQuestion.explicitDocumentId(rawQuestion);
+        if (eligible.isEmpty() || (preferredDocumentId != null
+                && eligible.stream().noneMatch(doc -> doc.id() == preferredDocumentId))) {
             return new Result(
                     question.route(),
                     List.of(),
@@ -99,7 +104,9 @@ public class SearchHybridWorkflow {
                 rawQuestion,
                 List.copyOf(allowed.keySet()),
                 contextMode(question.route()),
-                question.recentMeetings()
+                question.recentMeetings(),
+                preferredDocumentId,
+                question.inferredComparisonDays()
         );
         access.validate(scope);
         List<Passage> verified = new ArrayList<>();
@@ -194,12 +201,13 @@ public class SearchHybridWorkflow {
             Map<Long, EligibleDocument> allowed,
             List<Passage> verified
     ) {
-        if (passages == null || passages.size() > MAX_PASSAGES_PER_KIND
-                || supportingPassages.size() > MAX_PASSAGES_PER_KIND) {
+        int passageLimit = evidenceExpansion ? 7 : MAX_PASSAGES_PER_KIND;
+        if (passages == null || passages.size() > passageLimit
+                || supportingPassages.size() > passageLimit) {
             throw new IllegalStateException("Invalid hybrid context budget");
         }
         var allPassages = Stream.concat(passages.stream(), supportingPassages.stream()).toList();
-        int budget = supportingPassages.isEmpty() ? CONTEXT_TOKENS : SUPPORTING_CONTEXT_TOKENS;
+        int budget = evidenceExpansion || supportingPassages.isEmpty() ? CONTEXT_TOKENS : SUPPORTING_CONTEXT_TOKENS;
         if (allPassages.stream().anyMatch(p -> p.tokenCount() < 1)
                 || allPassages.stream().mapToLong(Passage::tokenCount).sum() > budget) {
             throw new IllegalStateException("Invalid hybrid context budget");
@@ -208,6 +216,7 @@ public class SearchHybridWorkflow {
                 .collect(Collectors.toSet());
         var primaryMeetings = primaryDocuments.stream().map(id -> allowed.get(id).meetingId())
                 .collect(Collectors.toSet());
+        int perMeeting = evidenceExpansion ? 3 : MAX_SUPPORTING_DOCUMENTS_PER_MEETING;
         var supportCounts = new HashMap<Long, Integer>();
         var seenDocuments = new HashSet<>(primaryDocuments);
         var eligibleSupport = supportingPassages.stream()
@@ -215,7 +224,7 @@ public class SearchHybridWorkflow {
                 .filter(p -> {
                     long meeting = allowed.get(p.documentId()).meetingId();
                     return primaryMeetings.contains(meeting)
-                            && supportCounts.merge(meeting, 1, Integer::sum) <= MAX_SUPPORTING_DOCUMENTS_PER_MEETING;
+                            && supportCounts.merge(meeting, 1, Integer::sum) <= perMeeting;
                 });
         Map<Long, List<Passage>> byDocument = Stream.concat(passages.stream(), eligibleSupport)
                 .filter(p -> allowed.containsKey(p.documentId()))
