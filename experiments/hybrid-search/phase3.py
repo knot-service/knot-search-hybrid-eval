@@ -140,7 +140,7 @@ def assemble(
 
 def quality(
     case: DraftCase, hits: tuple[Hit, ...], source: dict[int, SourceDoc],
-    tokenizer: PreTrainedTokenizerFast, *, expand: bool, balanced: bool = False,
+    tokenizer: PreTrainedTokenizerFast, *, expand: bool,
 ) -> Quality:
     start = perf_counter()
     context = assemble(hits, source, tokenizer, expand=expand)

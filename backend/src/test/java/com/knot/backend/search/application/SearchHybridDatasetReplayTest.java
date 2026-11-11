@@ -16,6 +16,7 @@ import com.knot.backend.search.application.dto.command.SearchQuestionCommand;
 import com.knot.backend.search.application.dto.result.SearchAnswerWorkResult;
 import com.knot.backend.search.application.dto.result.SearchDocumentResult;
 import com.knot.backend.search.infrastructure.llm.SearchLlmClient;
+import com.knot.backend.search.infrastructure.llm.SearchHybridIndexClient.Passage;
 import com.knot.backend.testsupport.TestApplicationProperties;
 import com.knot.backend.testsupport.TestcontainersConfiguration;
 import java.net.URI;
@@ -60,23 +61,8 @@ import tools.jackson.databind.ObjectMapper;
         "knot.search.hybrid.workspaces=1,458"})
 @Import(TestcontainersConfiguration.class)
 @TestApplicationProperties
-@EnabledIfEnvironmentVariable(named = "KNOT_PHASE4_FIXTURES", matches = ".+")
+@EnabledIfEnvironmentVariable(named = "KNOT_PHASE5_FIXTURES", matches = ".+")
 class SearchHybridDatasetReplayTest {
-    private static final Map<Long, Set<String>> SSE_CASES = Map.of(
-            1L,
-            Set.of(
-                    "W1-0024-01",
-                    "W1-0001-01",
-                    "W1-0322-01"
-            ),
-            458L,
-            Set.of(
-                    "S53-01",
-                    "S04-01",
-                    "S21-01"
-            )
-    );
-
     @Autowired
     private JdbcClient jdbc;
     @Autowired
@@ -102,14 +88,14 @@ class SearchHybridDatasetReplayTest {
     static void configure(DynamicPropertyRegistry properties) {
         properties.add(
                 "knot.search.hybrid.index-url",
-                () -> System.getenv("KNOT_PHASE4_INDEX_URL")
+                () -> System.getenv("KNOT_PHASE5_INDEX_URL")
         );
     }
 
     @Test
-    void replaysBothEvaluationSetsAndVerifiesRealWorkerSse() throws Exception {
+    void replaysEvidenceAndVerifiesRealWorkerSse() throws Exception {
         Dataset dataset = mapper.readValue(
-                Path.of(System.getenv("KNOT_PHASE4_FIXTURES"))
+                Path.of(System.getenv("KNOT_PHASE5_FIXTURES"))
                         .toFile(),
                 Dataset.class
         );
@@ -152,8 +138,7 @@ class SearchHybridDatasetReplayTest {
                         )
                 );
                 for (EvalCase item : workspace.cases()) {
-                    if (SSE_CASES.get(workspace.id())
-                            .contains(item.id())) {
+                    if (item.live()) {
                         sse.add(
                                 verifySse(
                                         http,
@@ -178,11 +163,11 @@ class SearchHybridDatasetReplayTest {
             assertThat(unauthorized.statusCode()).isEqualTo(403);
         }
 
-        Path output = Path.of(System.getenv("KNOT_PHASE4_FIXTURES"))
-                .resolveSibling("phase4-spring-report.json");
+        Path output = Path.of(System.getenv("KNOT_PHASE5_FIXTURES"))
+                .resolveSibling("phase5-spring-report.json");
         Path staging = Files.createTempFile(
                 output.getParent(),
-                "phase4-",
+                "phase5-",
                 ".json",
                 PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
         );
@@ -199,7 +184,16 @@ class SearchHybridDatasetReplayTest {
                 output,
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING
         );
-        assertThat(sse).hasSize(6);
+        long expectedLive = dataset.workspaces()
+                .stream()
+                .flatMap(
+                        workspace -> workspace.cases()
+                                .stream()
+                )
+                .filter(EvalCase::live)
+                .count();
+        assertThat(sse).hasSize((int) expectedLive);
+        assertThat(expectedLive).isGreaterThanOrEqualTo(6);
         for (SseObservation row : sse) {
             assertThat(row.completed()).as(
                     "SSE completed %s",
@@ -284,7 +278,10 @@ class SearchHybridDatasetReplayTest {
                                 item.expectedIds(),
                                 ids(result),
                                 result.questionNanos(),
-                                result.retrievalNanos()
+                                result.retrievalNanos(),
+                                result.passages(),
+                                result.rerankMs(),
+                                result.contextMs()
                         )
                 );
             }
@@ -324,6 +321,7 @@ class SearchHybridDatasetReplayTest {
         long answerId = 0;
         long firstDeltaNanos = 0;
         boolean completed = false;
+        StringBuilder answer = new StringBuilder();
         String event = "";
         try (var lines = response.body()) {
             var stream = lines.iterator();
@@ -341,10 +339,13 @@ class SearchHybridDatasetReplayTest {
                     answerId = data.path("answerMessageId")
                             .asLong();
                 }
-                if (event.equals("delta") && firstDeltaNanos == 0 && !data.path("text")
-                        .asText()
-                        .isBlank()) {
-                    firstDeltaNanos = System.nanoTime() - started;
+                if (event.equals("delta")) {
+                    String delta = data.path("text")
+                            .asText();
+                    answer.append(delta);
+                    if (firstDeltaNanos == 0 && !delta.isBlank()) {
+                        firstDeltaNanos = System.nanoTime() - started;
+                    }
                 }
                 completed |= event.equals("completed");
             }
@@ -392,6 +393,7 @@ class SearchHybridDatasetReplayTest {
                 item.expectedIds(),
                 ids(result),
                 cited,
+                answer.toString(),
                 firstDeltaNanos,
                 System.nanoTime() - started
         );
@@ -586,7 +588,8 @@ class SearchHybridDatasetReplayTest {
             String id,
             String question,
             Route route,
-            List<Long> expectedIds
+            List<Long> expectedIds,
+            boolean live
     ) {
     }
     private record Observation(
@@ -598,7 +601,10 @@ class SearchHybridDatasetReplayTest {
             List<Long> expectedIds,
             List<Long> candidateIds,
             long questionNanos,
-            long retrievalNanos
+            long retrievalNanos,
+            List<Passage> passages,
+            double rerankMs,
+            double contextMs
     ) {
     }
     private record SseObservation(
@@ -611,6 +617,7 @@ class SearchHybridDatasetReplayTest {
             List<Long> expectedIds,
             List<Long> candidateIds,
             List<Long> citedIds,
+            String answer,
             long firstDeltaNanos,
             long totalNanos
     ) {
