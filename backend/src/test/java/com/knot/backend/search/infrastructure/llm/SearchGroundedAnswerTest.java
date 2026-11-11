@@ -61,6 +61,35 @@ class SearchGroundedAnswerTest {
     }
 
     @Test
+    void acceptsExactExcerptAfterTheDocumentMeetingTime() {
+        var document = new SearchDocumentResult(
+                2158L,
+                "로그인 유지 시간 논의",
+                "세션",
+                "회의 시각(한국): 2026-10-15 23:59:00 +09:00\n## 결정\n세션 유지 시간은 확정되지 않았다.",
+                List.of("## 결정\n세션 유지 시간은 확정되지 않았다.")
+        );
+        var result = SearchGroundedAnswer.verify(
+                """
+                        {"insufficient":false,"claims":[
+                          {"text":"세션 유지 시간은 미확정이다.","sources":[
+                            {"evidenceId":"E2158","quote":"회의 시각(한국): 2026-10-15 23:59:00 +09:00\\n## 결정\\n세션 유지 시간은 확정되지 않았다."}]},
+                          {"text":"시각이 다른 주장","sources":[
+                            {"evidenceId":"E2158","quote":"회의 시각(한국): 2026-10-16 23:59:00 +09:00\\n세션 유지 시간은 확정되지 않았다."}]},
+                          {"text":"원문이 바뀐 주장","sources":[
+                            {"evidenceId":"E2158","quote":"회의 시각(한국): 2026-10-15 23:59:00 +09:00\\n세션 유지 시간은 1시간으로 확정되었다."}]}
+                        ]}
+                        """,
+                List.of(document),
+                mapper
+        );
+        assertThat(result.claims()).hasSize(1);
+        assertThat(result.documentIds()).containsExactly(2158L);
+        assertThat(result.render()).contains("세션 유지 시간은 확정되지 않았다.")
+                .doesNotContain("회의 시각", "시각이 다른 주장", "원문이 바뀐 주장");
+    }
+
+    @Test
     void doesNotAcceptModelTextAfterJson() {
         assertThatThrownBy(
                 () -> SearchGroundedAnswer.verify(

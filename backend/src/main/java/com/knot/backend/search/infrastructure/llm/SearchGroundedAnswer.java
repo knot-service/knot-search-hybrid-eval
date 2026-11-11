@@ -145,15 +145,16 @@ record SearchGroundedAnswer(
             );
         }
         for (Claim claim : answer.claims()) {
-            if (!validClaim(
+            Claim checked = verifiedClaim(
                     claim,
                     sources
-            )) {
+            );
+            if (checked == null) {
                 incomplete = true;
                 continue;
             }
             Set<Long> combined = new LinkedHashSet<>(used);
-            claim.sources()
+            checked.sources()
                     .forEach(
                             source -> combined.add(
                                     sources.get(source.evidenceId())
@@ -165,7 +166,7 @@ record SearchGroundedAnswer(
                 continue;
             }
             used = combined;
-            valid.add(claim);
+            valid.add(checked);
         }
         return new Verified(
                 List.copyOf(valid),
@@ -174,47 +175,54 @@ record SearchGroundedAnswer(
         );
     }
 
-    private static boolean validClaim(
+    private static Claim verifiedClaim(
             Claim claim,
             Map<String, SearchDocumentResult> sources
     ) {
-        return claim != null && claim.text() != null && !claim.text()
-                .isBlank() && claim.text()
-                        .length() <= 600
-                && claim.sources() != null && !claim.sources()
-                        .isEmpty()
-                && claim.sources()
-                        .size() <= MAX_SOURCES_PER_CLAIM
-                && claim.sources()
-                        .stream()
-                        .allMatch(
-                                source -> matches(
-                                        source,
-                                        sources
-                                )
-                        );
+        if (claim == null || claim.text() == null || claim.text().isBlank()
+                || claim.text().length() > 600 || claim.sources() == null
+                || claim.sources().isEmpty() || claim.sources().size() > MAX_SOURCES_PER_CLAIM) {
+            return null;
+        }
+        List<Source> verified = new ArrayList<>();
+        for (Source source : claim.sources()) {
+            Source checked = verifiedSource(source, sources);
+            if (checked == null) {
+                return null;
+            }
+            verified.add(checked);
+        }
+        return new Claim(claim.text(), List.copyOf(verified));
     }
 
-    private static boolean matches(
+    private static Source verifiedSource(
             Source source,
             Map<String, SearchDocumentResult> sources
     ) {
-        if (source == null || source.quote() == null || source.quote()
-                .strip()
-                .length() < 8 || source.quote()
-                        .strip()
-                        .length() > 300) {
-            return false;
+        if (source == null || source.quote() == null) {
+            return null;
         }
         SearchDocumentResult document = sources.get(source.evidenceId());
-        return document != null && document.excerpts()
-                .stream()
-                .anyMatch(
-                        excerpt -> excerpt.contains(
-                                source.quote()
-                                        .strip()
-                        )
-                );
+        if (document == null) {
+            return null;
+        }
+        String quote = source.quote().strip();
+        if (matchesExcerpt(quote, document)) {
+            return new Source(source.evidenceId(), quote);
+        }
+        String content = document.content();
+        int headerEnd = content == null ? -1 : content.indexOf('\n');
+        if (headerEnd < 0 || !content.startsWith("회의 시각(한국): ")
+                || !quote.startsWith(content.substring(0, headerEnd + 1))) {
+            return null;
+        }
+        String excerptQuote = quote.substring(headerEnd + 1).strip();
+        return matchesExcerpt(excerptQuote, document) ? new Source(source.evidenceId(), excerptQuote) : null;
+    }
+
+    private static boolean matchesExcerpt(String quote, SearchDocumentResult document) {
+        return quote.length() >= 8 && quote.length() <= 300
+                && document.excerpts().stream().anyMatch(excerpt -> excerpt.contains(quote));
     }
 
     record Claim(
