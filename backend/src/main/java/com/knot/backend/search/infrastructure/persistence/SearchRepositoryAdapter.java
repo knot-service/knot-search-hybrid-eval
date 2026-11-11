@@ -150,6 +150,10 @@ public class SearchRepositoryAdapter implements SearchRepository {
         );
     }
 
+    public List<Long> findQueuedAnswerIds(boolean lookupOnly, int limit) {
+        return executions.findQueuedByLane(lookupOnly, PageRequest.of(0, limit));
+    }
+
     public List<Long> findExpiredAnswerIds(
             Instant now,
             int limit

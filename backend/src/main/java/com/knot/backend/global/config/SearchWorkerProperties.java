@@ -14,6 +14,7 @@ public class SearchWorkerProperties {
 
     private boolean enabled;
     private int concurrency = 2;
+    private int lookupConcurrency;
     private int candidateLimit = 20;
     private Duration pollInterval = Duration.ofSeconds(1);
     private Duration executionLease = Duration.ofSeconds(150);
@@ -40,7 +41,10 @@ public class SearchWorkerProperties {
     }
 
     private void validateCandidateLimit() {
-        if (candidateLimit < concurrency || candidateLimit > 100) {
+        if (lookupConcurrency < 0 || lookupConcurrency > 16) {
+            throw new SearchException(SearchErrorCode.INVALID_SEARCH_CONFIGURATION);
+        }
+        if (candidateLimit < Math.max(concurrency, lookupConcurrency) || candidateLimit > 100) {
             throw new SearchException(SearchErrorCode.INVALID_SEARCH_CONFIGURATION);
         }
     }

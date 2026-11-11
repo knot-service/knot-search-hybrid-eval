@@ -73,6 +73,8 @@ class SearchAnswerRetryIntegrationTest {
     @MockitoBean
     private SearchGenerationAvailability availability;
     @MockitoBean
+    private SearchLookupLane lookupLane;
+    @MockitoBean
     private SearchDocumentRetriever retriever;
     @MockitoBean
     private SearchIntentClassifier classifier;
@@ -178,6 +180,19 @@ class SearchAnswerRetryIntegrationTest {
                 old.token(),
                 "ANSWER_GENERATION_FAILED"
         );
+    }
+
+    @Test
+    @DisplayName("분리 전 실패 작업을 재시도하면 현재 경로를 다시 저장한다")
+    void retryUsesCurrentLookupLaneForExistingAnswer() {
+        assertThat(old.lookupOnly()).isFalse();
+        when(lookupLane.usesLookupWorker(workspace, old.question())).thenReturn(true);
+
+        retry(UUID.randomUUID());
+
+        assertThat(repository.findQueuedAnswerIds(true, 20)).containsExactly(old.answerId());
+        assertThat(repository.findQueuedAnswerIds(false, 20)).isEmpty();
+        assertThat(executions.claim(old.answerId()).orElseThrow().lookupOnly()).isTrue();
     }
 
     @Test

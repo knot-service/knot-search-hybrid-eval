@@ -31,6 +31,7 @@ public class SearchQuestionIntakeService {
     private final SearchRepository repository;
     private final SearchGenerationAvailability availability;
     private final Clock clock;
+    private final SearchLookupLane lookupLane;
 
     @Transactional
     public SearchQuestionAcceptedResult acceptFirst(
@@ -205,7 +206,8 @@ public class SearchQuestionIntakeService {
                         conversationId,
                         question.getId(),
                         answer.getId(),
-                        acceptedAt
+                        acceptedAt,
+                        lookupLane.usesLookupWorker(conversation.getWorkspaceId(), command.content())
                 )
         );
         conversation.recordMessageActivity(acceptedAt);
@@ -297,7 +299,8 @@ public class SearchQuestionIntakeService {
                         conversationId,
                         question.getId(),
                         answer.getId(),
-                        acceptedAt
+                        acceptedAt,
+                        lookupLane.usesLookupWorker(workspaceId, command.content())
                 )
         );
         repository.flush();

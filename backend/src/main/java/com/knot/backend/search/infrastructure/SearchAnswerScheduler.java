@@ -6,6 +6,7 @@ import com.knot.backend.search.application.SearchAnswerExecutionService;
 import com.knot.backend.search.application.SearchAnswerWorker;
 import com.knot.backend.search.domain.repository.SearchRepository;
 import java.time.Clock;
+import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -26,6 +27,7 @@ public class SearchAnswerScheduler {
     private final SearchAnswerExecutionService executions;
     private final SearchWorkerProperties properties;
     private final ThreadPoolTaskExecutor executor;
+    private final ThreadPoolTaskExecutor lookupExecutor;
     private final Clock clock;
 
     public SearchAnswerScheduler(
@@ -34,6 +36,7 @@ public class SearchAnswerScheduler {
             SearchAnswerExecutionService executions,
             SearchWorkerProperties properties,
             @Qualifier("searchGenerationExecutor") ThreadPoolTaskExecutor executor,
+            @Qualifier("searchLookupExecutor") ThreadPoolTaskExecutor lookupExecutor,
             Clock clock
     ) {
         this.repository = repository;
@@ -41,6 +44,7 @@ public class SearchAnswerScheduler {
         this.executions = executions;
         this.properties = properties;
         this.executor = executor;
+        this.lookupExecutor = lookupExecutor;
         this.clock = clock;
     }
 
@@ -58,9 +62,19 @@ public class SearchAnswerScheduler {
     }
 
     private void dispatchQueuedCandidates() {
-        for (long answerId : repository.findQueuedAnswerIds(properties.getCandidateLimit())) {
+        int limit = properties.getCandidateLimit();
+        if (properties.getLookupConcurrency() == 0) {
+            dispatch(executor, repository.findQueuedAnswerIds(limit));
+            return;
+        }
+        dispatch(lookupExecutor, repository.findQueuedAnswerIds(true, limit));
+        dispatch(executor, repository.findQueuedAnswerIds(false, limit));
+    }
+
+    private void dispatch(ThreadPoolTaskExecutor target, List<Long> candidates) {
+        for (long answerId : candidates) {
             try {
-                executor.execute(() -> execute(answerId));
+                target.execute(() -> execute(answerId));
             } catch (TaskRejectedException exception) {
                 return;
             }

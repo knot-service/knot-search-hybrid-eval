@@ -20,11 +20,22 @@ public class SearchWorkerConfig {
     @ConditionalOnProperty(prefix = "knot.search.worker", name = "enabled", havingValue = "true")
     public ThreadPoolTaskExecutor searchGenerationExecutor(SearchWorkerProperties properties) {
         properties.validate();
+        return workerExecutor(properties.getConcurrency(), "search-generation-");
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "knot.search.worker", name = "enabled", havingValue = "true")
+    public ThreadPoolTaskExecutor searchLookupExecutor(SearchWorkerProperties properties) {
+        properties.validate();
+        return workerExecutor(Math.max(1, properties.getLookupConcurrency()), "search-lookup-");
+    }
+
+    private ThreadPoolTaskExecutor workerExecutor(int concurrency, String threadNamePrefix) {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(properties.getConcurrency());
-        executor.setMaxPoolSize(properties.getConcurrency());
+        executor.setCorePoolSize(concurrency);
+        executor.setMaxPoolSize(concurrency);
         executor.setQueueCapacity(0);
-        executor.setThreadNamePrefix("search-generation-");
+        executor.setThreadNamePrefix(threadNamePrefix);
         executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
         executor.setWaitForTasksToCompleteOnShutdown(false);
         return executor;

@@ -103,8 +103,15 @@ public class SearchAnswerWorker {
                 startedAt.plus(agentProperties.getBudget())
         );
         SearchHybridWorkflow hybrid = hybridWorkflows.getIfAvailable();
-        if (hybrid != null && hybrid.enabledFor(scope.workspaceId())) {
+        boolean hybridEnabled = hybrid != null && hybrid.enabledFor(scope.workspaceId());
+        if (work.lookupOnly() && (!hybridEnabled || !SearchHybridQuestion.isDocumentFind(work.question()))) {
+            throw new IllegalStateException("Lookup-only execution cannot use the generation path");
+        }
+        if (hybridEnabled) {
             SearchHybridWorkflow.Result result = hybrid.retrieve(scope, work.question());
+            if (work.lookupOnly() && result.route() != Route.DOCUMENT_FIND) {
+                throw new IllegalStateException("Lookup-only execution returned a generation route");
+            }
             log.info(
                     "Hybrid search workspaceId={} answerId={} route={} questionMs={} retrievalMs={} rerankMs={} contextMs={} candidates={}",
                     work.workspaceId(), work.answerId(), result.route(), result.questionNanos() / 1_000_000,

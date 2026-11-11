@@ -30,6 +30,7 @@ public class SearchAnswerRetryService {
     private final SearchRepository repository;
     private final SearchGenerationAvailability availability;
     private final Clock clock;
+    private final SearchLookupLane lookupLane;
 
     @Transactional
     public SearchQuestionAcceptedResult acceptRetry(
@@ -69,10 +70,8 @@ public class SearchAnswerRetryService {
                     questionId
             );
         }
-        SearchMessage answer = pairedAnswer(
-                conversationId,
-                questionId
-        );
+        SearchMessage question = findUserQuestion(conversationId, questionId);
+        SearchMessage answer = pairedAnswer(conversationId, question);
         if (repository.existsStreamingAnswer(conversationId)) {
             throw new SearchException(SearchErrorCode.ANSWER_ALREADY_IN_PROGRESS);
         }
@@ -88,7 +87,7 @@ public class SearchAnswerRetryService {
                 questionId
         );
         answer.retry();
-        execution.retry();
+        execution.retry(lookupLane.usesLookupWorker(workspaceId, question.getContent()));
         repository.deleteEvidences(answer.getId());
         SearchRequestReceipt receipt = repository.save(
                 SearchRequestReceipt.retry(
@@ -141,7 +140,7 @@ public class SearchAnswerRetryService {
         }
     }
 
-    private SearchMessage pairedAnswer(
+    private SearchMessage findUserQuestion(
             long conversationId,
             long questionId
     ) {
@@ -153,6 +152,10 @@ public class SearchAnswerRetryService {
         if (question.getRole() != SearchMessageRole.USER) {
             throw new SearchException(SearchErrorCode.QUESTION_NOT_FOUND);
         }
+        return question;
+    }
+
+    private SearchMessage pairedAnswer(long conversationId, SearchMessage question) {
         if (question.getSequence() == Integer.MAX_VALUE) {
             throw new SearchException(SearchErrorCode.QUESTION_NOT_FOUND);
         }

@@ -736,6 +736,7 @@ class SearchAnswerExecutionIntegrationTest {
                 service,
                 new com.knot.backend.global.config.SearchWorkerProperties(),
                 executor,
+                executor,
                 clock
         );
         restarted.dispatchQueued();

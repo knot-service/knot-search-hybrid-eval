@@ -35,6 +35,8 @@ class SearchAnswerSchedulerTest {
     private SearchAnswerExecutionService executions;
     private ThreadPoolTaskExecutor executor;
     private SearchAnswerScheduler scheduler;
+    private ThreadPoolTaskExecutor lookupExecutor;
+    private SearchWorkerProperties properties;
 
     @BeforeEach
     void setUp() {
@@ -42,12 +44,15 @@ class SearchAnswerSchedulerTest {
         worker = mock(SearchAnswerWorker.class);
         executions = mock(SearchAnswerExecutionService.class);
         executor = mock(ThreadPoolTaskExecutor.class);
+        lookupExecutor = mock(ThreadPoolTaskExecutor.class);
+        properties = new SearchWorkerProperties();
         scheduler = new SearchAnswerScheduler(
                 repository,
                 worker,
                 executions,
-                new SearchWorkerProperties(),
+                properties,
                 executor,
+                lookupExecutor,
                 Clock.fixed(
                         NOW,
                         ZoneOffset.UTC
@@ -95,6 +100,26 @@ class SearchAnswerSchedulerTest {
                 worker,
                 executions
         );
+    }
+
+    @Test
+    @DisplayName("생성 슬롯이 가득 차도 문서 찾기 큐를 처리한다")
+    void dispatchLookupWhenGenerationIsSaturated() {
+        properties.setLookupConcurrency(1);
+        when(repository.findQueuedAnswerIds(true, 20)).thenReturn(List.of(2L));
+        when(repository.findQueuedAnswerIds(false, 20)).thenReturn(List.of(1L));
+        doThrow(new TaskRejectedException("full")).when(executor).execute(any());
+        doAnswer(call -> {
+            Runnable task = call.getArgument(0);
+            task.run();
+            return null;
+        }).when(lookupExecutor).execute(any());
+
+        scheduler.dispatchQueued();
+
+        verify(worker).execute(2L);
+        verify(executor).execute(any());
+        verifyNoInteractions(executions);
     }
 
     @Test

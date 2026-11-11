@@ -21,6 +21,12 @@ interface SearchAnswerExecutionJpaRepository extends JpaRepository<SearchAnswerE
 
     @Query("""
             select e.answerId from SearchAnswerExecution e
+            where e.state = 'QUEUED' and e.lookupOnly = :lookupOnly order by e.createdAt, e.answerId
+            """)
+    List<Long> findQueuedByLane(boolean lookupOnly, Pageable pageable);
+
+    @Query("""
+            select e.answerId from SearchAnswerExecution e
             where e.state = 'RUNNING' and e.deadlineAt <= :now order by e.deadlineAt, e.answerId
             """)
     List<Long> findExpired(

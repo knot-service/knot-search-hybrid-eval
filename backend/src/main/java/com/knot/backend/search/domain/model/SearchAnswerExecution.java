@@ -48,6 +48,9 @@ public class SearchAnswerExecution {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
+    @Column(name = "lookup_only", nullable = false)
+    private boolean lookupOnly;
+
     protected SearchAnswerExecution() {}
 
     public static SearchAnswerExecution queue(
@@ -55,6 +58,16 @@ public class SearchAnswerExecution {
             long questionId,
             long answerId,
             Instant createdAt
+    ) {
+        return queue(conversationId, questionId, answerId, createdAt, false);
+    }
+
+    public static SearchAnswerExecution queue(
+            long conversationId,
+            long questionId,
+            long answerId,
+            Instant createdAt,
+            boolean lookupOnly
     ) {
         if (conversationId <= 0 || questionId <= 0 || answerId <= 0 || questionId == answerId) {
             throw new SearchException(SearchErrorCode.INVALID_SEARCH_STATE);
@@ -68,6 +81,7 @@ public class SearchAnswerExecution {
         execution.answerId = answerId;
         execution.state = SearchExecutionState.QUEUED;
         execution.createdAt = createdAt;
+        execution.lookupOnly = lookupOnly;
         return execution;
     }
 
@@ -116,6 +130,10 @@ public class SearchAnswerExecution {
     }
 
     public void retry() {
+        retry(lookupOnly);
+    }
+
+    public void retry(boolean useLookupWorker) {
         if (state != SearchExecutionState.FINISHED) {
             throw new SearchException(SearchErrorCode.INVALID_SEARCH_STATE);
         }
@@ -123,6 +141,7 @@ public class SearchAnswerExecution {
         deadlineAt = null;
         stage = null;
         excludedCount = null;
+        lookupOnly = useLookupWorker;
         state = SearchExecutionState.QUEUED;
     }
 

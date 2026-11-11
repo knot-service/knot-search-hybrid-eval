@@ -83,6 +83,18 @@ class SearchAnswerWorkerIntentTest {
     }
 
     @Test
+    void queuedLookupNeverFallsThroughToModelWithoutHybridWorkflow() {
+        when(executions.claim(5)).thenReturn(Optional.of(new SearchAnswerWorkResult(
+                1, 2, 3, 4, 5, token, "회의 문서 찾아줘", Clock.systemUTC().instant(), true
+        )));
+
+        worker.execute(5);
+
+        verify(executions).fail(5, token, "ANSWER_GENERATION_FAILED");
+        verifyNoInteractions(classifier, retriever, generator);
+    }
+
+    @Test
     @DisplayName("분류가 끝나기 전 검색·생성·본문 저장이 없다")
     void execute_success_noDeltaBeforeClassification() throws Exception {
         CountDownLatch entered = new CountDownLatch(1);

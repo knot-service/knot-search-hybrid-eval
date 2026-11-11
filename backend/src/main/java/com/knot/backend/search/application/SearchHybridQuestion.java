@@ -85,12 +85,15 @@ public record SearchHybridQuestion(
         );
     }
 
+    static boolean isDocumentFind(String question) {
+        return DOCUMENT_REQUEST.matcher(Normalizer.normalize(question, Normalizer.Form.NFKC)).find();
+    }
+
     private static Route route(
             String question,
             int count
     ) {
-        if (DOCUMENT_REQUEST.matcher(question)
-                .find()) {
+        if (isDocumentFind(question)) {
             return Route.DOCUMENT_FIND;
         }
         if (count > 1 || MULTIPLE_MEETINGS.matcher(question)
