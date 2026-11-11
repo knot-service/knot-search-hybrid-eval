@@ -2,6 +2,7 @@ package com.knot.backend.search.application;
 
 import static org.mockito.ArgumentMatchers.any;
 import com.knot.backend.search.domain.model.SearchIntent;
+import com.knot.backend.search.domain.repository.SearchGenerationCandidate;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.when;
@@ -104,6 +105,25 @@ class SearchAnswerExecutionIntegrationTest {
                         UUID.randomUUID()
                 )
         );
+    }
+
+    @Test
+    void generationQueuePrefersQuestionsAndExcludesLookup() {
+        long firstQuestion = intake.acceptFirst(workspaceId, memberId,
+                new SearchQuestionCommand("첫 내용 질문", UUID.randomUUID())).answerMessageId();
+        long secondQuestion = intake.acceptFirst(workspaceId, memberId,
+                new SearchQuestionCommand("다음 내용 질문", UUID.randomUUID())).answerMessageId();
+        long lookup = intake.acceptFirst(workspaceId, memberId,
+                new SearchQuestionCommand("회의 문서 찾아줘", UUID.randomUUID())).answerMessageId();
+        jdbc.sql("UPDATE search_answer_executions SET question_only = true WHERE answer_id IN (:first, :second)")
+                .param("first", firstQuestion).param("second", secondQuestion).update();
+        jdbc.sql("UPDATE search_answer_executions SET lookup_only = true WHERE answer_id = :lookup")
+                .param("lookup", lookup).update();
+
+        assertThat(repository.findQueuedGenerationByPriority(3)).containsExactly(
+                new SearchGenerationCandidate(firstQuestion, true),
+                new SearchGenerationCandidate(secondQuestion, true),
+                new SearchGenerationCandidate(accepted.answerMessageId(), false));
     }
 
     @Test

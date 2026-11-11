@@ -73,8 +73,12 @@ public class SearchAnswerScheduler {
         }
         if (properties.isSplitGenerationRoutes()) {
             dispatch(lookupExecutor, repository.findQueuedAnswerIds(true, limit), SearchExecutionLane.LOOKUP);
-            dispatch(executor, repository.findQueuedGenerationAnswerIds(true, limit), SearchExecutionLane.QUESTION);
-            dispatch(synthesisExecutor, repository.findQueuedGenerationAnswerIds(false, limit), SearchExecutionLane.DEFAULT);
+            if (properties.isShareGenerationSlots()) {
+                dispatchByPriority(limit);
+            } else {
+                dispatch(executor, repository.findQueuedGenerationAnswerIds(true, limit), SearchExecutionLane.QUESTION);
+                dispatch(synthesisExecutor, repository.findQueuedGenerationAnswerIds(false, limit), SearchExecutionLane.DEFAULT);
+            }
         } else {
             dispatch(lookupExecutor, repository.findQueuedAnswerIds(true, limit));
             dispatch(executor, repository.findQueuedAnswerIds(false, limit));
@@ -87,11 +91,26 @@ public class SearchAnswerScheduler {
 
     private void dispatch(ThreadPoolTaskExecutor target, List<Long> candidates, SearchExecutionLane expectedLane) {
         for (long answerId : candidates) {
-            try {
-                target.execute(() -> execute(answerId, expectedLane));
-            } catch (TaskRejectedException exception) {
+            if (!submit(target, answerId, expectedLane)) {
                 return;
             }
+        }
+    }
+
+    private void dispatchByPriority(int limit) {
+        for (var candidate : repository.findQueuedGenerationByPriority(limit)) {
+            if (!submit(executor, candidate.answerId(), candidate.lane())) {
+                return;
+            }
+        }
+    }
+
+    private boolean submit(ThreadPoolTaskExecutor target, long answerId, SearchExecutionLane expectedLane) {
+        try {
+            target.execute(() -> execute(answerId, expectedLane));
+            return true;
+        } catch (TaskRejectedException exception) {
+            return false;
         }
     }
 

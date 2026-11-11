@@ -17,6 +17,7 @@ import com.knot.backend.global.config.SearchWorkerProperties;
 import com.knot.backend.search.application.SearchAnswerExecutionService;
 import com.knot.backend.search.application.SearchAnswerWorker;
 import com.knot.backend.search.domain.model.SearchExecutionLane;
+import com.knot.backend.search.domain.repository.SearchGenerationCandidate;
 import com.knot.backend.search.domain.repository.SearchRepository;
 import java.time.Clock;
 import java.time.Instant;
@@ -104,6 +105,30 @@ class SearchAnswerSchedulerTest {
                 worker,
                 executions
         );
+    }
+
+    @Test
+    void sharedPoolAcceptsBothRoutesWithoutUsingFixedExecutor() {
+        properties.setLookupConcurrency(1);
+        properties.setSplitGenerationRoutes(true);
+        properties.setShareGenerationSlots(true);
+        when(repository.findQueuedGenerationByPriority(20)).thenReturn(
+                List.of(new SearchGenerationCandidate(2L, true), new SearchGenerationCandidate(3L, true)),
+                List.of(new SearchGenerationCandidate(4L, false), new SearchGenerationCandidate(5L, false)));
+        doAnswer(call -> {
+            Runnable task = call.getArgument(0);
+            task.run();
+            return null;
+        }).when(executor).execute(any());
+
+        scheduler.dispatchQueued();
+        scheduler.dispatchQueued();
+
+        verify(worker).execute(2L, SearchExecutionLane.QUESTION);
+        verify(worker).execute(3L, SearchExecutionLane.QUESTION);
+        verify(worker).execute(4L, SearchExecutionLane.DEFAULT);
+        verify(worker).execute(5L, SearchExecutionLane.DEFAULT);
+        verifyNoInteractions(synthesisExecutor);
     }
 
     @Test

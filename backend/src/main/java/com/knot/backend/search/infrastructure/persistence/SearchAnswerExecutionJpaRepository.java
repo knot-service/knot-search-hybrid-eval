@@ -1,6 +1,7 @@
 package com.knot.backend.search.infrastructure.persistence;
 
 import com.knot.backend.search.domain.model.SearchAnswerExecution;
+import com.knot.backend.search.domain.repository.SearchGenerationCandidate;
 import jakarta.persistence.LockModeType;
 import java.time.Instant;
 import java.util.List;
@@ -31,6 +32,13 @@ interface SearchAnswerExecutionJpaRepository extends JpaRepository<SearchAnswerE
             order by e.createdAt, e.answerId
             """)
     List<Long> findQueuedGenerationByLane(boolean questionOnly, Pageable pageable);
+
+    @Query("""
+            select new com.knot.backend.search.domain.repository.SearchGenerationCandidate(e.answerId, e.questionOnly)
+            from SearchAnswerExecution e where e.state = 'QUEUED' and e.lookupOnly = false
+            order by e.questionOnly desc, e.createdAt, e.answerId
+            """)
+    List<SearchGenerationCandidate> findQueuedGenerationByPriority(Pageable pageable);
 
     @Query("""
             select e.answerId from SearchAnswerExecution e

@@ -1,5 +1,7 @@
 package com.knot.backend.search.infrastructure.persistence;
 
+import com.knot.backend.search.domain.repository.SearchGenerationCandidate;
+
 import com.knot.backend.search.domain.model.SearchAnswerExecution;
 import com.knot.backend.search.domain.model.SearchConversation;
 import com.knot.backend.search.domain.model.SearchEvidence;
@@ -157,6 +159,11 @@ public class SearchRepositoryAdapter implements SearchRepository {
     @Override
     public List<Long> findQueuedGenerationAnswerIds(boolean questionOnly, int limit) {
         return executions.findQueuedGenerationByLane(questionOnly, PageRequest.of(0, limit));
+    }
+
+    @Override
+    public List<SearchGenerationCandidate> findQueuedGenerationByPriority(int limit) {
+        return executions.findQueuedGenerationByPriority(PageRequest.of(0, limit));
     }
 
     public List<Long> findExpiredAnswerIds(
