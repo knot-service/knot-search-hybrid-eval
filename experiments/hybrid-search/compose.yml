@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    container_name: knot-search-hybrid-db
+    env_file: .local/postgres.env
+    ports:
+      - "127.0.0.1:55448:5432"
+    volumes:
+      - corpus:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "knot_hybrid", "-d", "knot_hybrid"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  corpus:

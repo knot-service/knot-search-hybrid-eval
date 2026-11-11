@@ -1,0 +1,44 @@
+# Workspace 검색 비교
+
+기존 Knot 탐색 평가실의 **하이브리드 검색 실험** 메뉴에서 검색 방식 비교, 문서 찾기, 회의 종합을 실행한다. 이 폴더의 Python 실행기는 로컬 포트 18173으로 연결된다. 기준 브랜치는 Knot `be/refactor/#715`의 `cb08773ab`다.
+
+## 로컬 실행
+
+이 폴더에서 Python 3.12와 Docker를 사용한다.
+
+```sh
+uv venv --python 3.12
+uv pip install -r requirements.txt
+.venv/bin/python database.py prepare
+docker compose --project-name knot-hybrid-search up -d --wait
+.venv/bin/python snapshot.py /path/to/knot-search-lab/experiments/workspace458-v130-separate-fixture-crosswalk-20261111.json
+.venv/bin/python database.py .local/workspace458.json
+KNOT_EVAL_ENV_FILE=/path/to/knot/backend/.env.search-local ./launch-local.sh
+```
+
+458은 기존 Playground DB에서 현재 합성 멤버 1의 DRAFT·ARCHIVED 문서를 조회한다. Eval DB의 잠긴 v1.30에서 질문과 기대 근거만 읽고, 별도 실행 조건이나 대화 이력이 필요한 사례와 기대 근거가 없는 사례를 제외한다. 두 소스는 읽기 전용으로 조회한다. 생성 요청에는 기존 Eval의 `LLM_*` 설정을 사용한다.
+
+별도 PostgreSQL은 로컬 55448에서 실행되고 `workspaces.id`로 코퍼스를 구분한다. 운영 Workspace 1을 가져올 때는 권한이 확인된 연결에서 `psql -XqAt -v ON_ERROR_STOP=1`로 `workspace1.sql`을 실행하고, 출력은 권한 600의 `.local/workspace1.json`으로 받는다. `.venv/bin/python database.py .local/workspace1.json`으로 로컬 DB에 가져온 뒤 작업용 덤프 파일을 삭제할 수 있다. 운영 덤프에는 검색용 문서와 녹음 시작 시각만 들어간다. 현재 실행기는 합성 458에만 질의하고 Qwen에도 458 근거만 보낸다.
+
+## 비교 조건
+
+- 기준 시각은 2026-11-11 00:00 KST다. 90개 합성 문서와 기대 근거가 있는 단일 턴 55개 질문을 사용한다.
+- 세 방식은 제목·주제·요약을 공통 검색 표현으로 쓴다. 요약이 비면 본문 앞 750자를 사용한다. 키워드는 BM25, 벡터는 CPU에서 multilingual-e5-small로 임베딩한 뒤 pgvector에서 정확 코사인 검색, 하이브리드는 각 방식의 상위 20개를 RRF로 결합한다.
+- 측정은 문서 단위 Recall@10, 모든 기대 근거 포함률, 검색 p50·p95다. 검색 시간은 벡터 모드의 질문 임베딩을 포함한다. 하이브리드 시간은 두 검색과 결합의 합이다. 프로세스 시작과 문서 임베딩은 검색 시간에서 제외한다.
+- 문서 찾기는 녹음 시각과 배포·안정성 주제로 가장 최근 회의를 찾은 뒤 하이브리드 후보를 반환한다. 종합은 같은 기준의 최근 세 회의에서 한 건씩 근거를 뽑아, 본문의 관련 단락과 요약을 Qwen에 제공한다.
+- 실행 결과는 `.local/runs/`에 기록한다. 첫 모델 응답 시간은 실행 시작부터 첫 내용 토큰까지다. 화면에는 전체 응답 수신 후 답변과 출처를 표시한다.
+
+## 2026-11-11 첫 비교 결과
+
+Chrome에서 실행한 55문항 비교 `f831b1c88db5424fba38ecfbb957c02c`의 결과다.
+
+| 방식 | Recall@10 | 모든 기대 근거 포함 | 검색 p50 | 검색 p95 |
+| --- | ---: | ---: | ---: | ---: |
+| BM25 | 52.7% | 49.1% | 0.128 ms | 0.234 ms |
+| 벡터 | 80.6% | 78.2% | 15.072 ms | 43.438 ms |
+| RRF 하이브리드 | 79.1% | 76.4% | 15.207 ms | 43.616 ms |
+
+RRF는 벡터 단독 대비 53개 사례에서 같은 Recall@10을 기록했고 2개에서 떨어졌다. `S19-01`, `S69-02`에서 기대 문서 2207이 상위 10개 밖으로 밀렸다. 이 55개는 검색 품질을 비교할 수 있는 부분집합이며, 답변 정확도나 운영 지연을 대표하지 않는다.
+
+- 문서 찾기 `e301b33b8a384c719484335447abff09`는 문서 2154를 반환했다. 생성 모델 호출은 0회, 실행기 처리 시간은 21.1 ms였다.
+- 회의 종합 `12d83ef7fa23484ca924aa2655a6222e`는 기존 Eval 설정의 Qwen을 1회 호출하고 2156, 2181, 2154를 날짜순으로 인용했다. 첫 모델 내용은 1.99초, 전체는 2.97초였다. 10월 21일의 목표 날짜와 11월 1일의 자동 배포 전환은 근거 본문에 있었다. 10월 21일 기록에서 실제 배포일 확정을 확인할 수 없다는 점은 모델 응답보다 원문 표현이 더 좁다.
