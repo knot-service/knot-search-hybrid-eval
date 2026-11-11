@@ -6,14 +6,18 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.YearMonth;
 import java.time.ZoneId;
+import java.util.List;
 import java.util.regex.Pattern;
 
 public record SearchHybridQuestion(
         Route route,
-        Instant recordedFrom,
-        Instant recordedBefore,
+        List<DateRange> recordedDates,
         int recentMeetings
 ) {
+    public SearchHybridQuestion {
+        recordedDates = List.copyOf(recordedDates);
+    }
+
     private static final ZoneId KOREA = ZoneId.of("Asia/Seoul");
     private static final String DOCUMENT = "(?:회의(?:록|\\s*문서)?|문서|기록|자료|링크|목록)";
     private static final String REQUEST_END = "\\s*(?:[.!?…]+\\s*)?$";
@@ -39,7 +43,11 @@ public record SearchHybridQuestion(
             .compile("(?:최근|지난)\\s*(\\d{1,2}|한|두|세|네|다섯)\\s*(?:번|회(?!의)|차례|건)");
     private static final Pattern ISO_DATE = Pattern.compile("(?<!\\d)\\d{4}-\\d{2}-\\d{2}(?!\\d)");
     private static final Pattern MONTH_DAY = Pattern.compile("(?:(\\d{4})년\\s*)?(\\d{1,2})월\\s*(?:(\\d{1,2})일)?");
-    private static final Pattern TRAILING_DAY = Pattern.compile("^\\s*(?:부터|과|와|~|–|-|에서)\\s*(\\d{1,2})일");
+    private static final String DATE_LIST = "과|와|이랑|랑|하고|및|,";
+    private static final Pattern TRAILING_DAY = Pattern.compile(
+            "^\\s*(부터|~|–|-|에서|" + DATE_LIST + ")\\s*(\\d{1,2})일");
+    private static final Pattern DATE_CONJUNCTION = Pattern.compile("\\s*(?:" + DATE_LIST + ")\\s*");
+    private static final Pattern TEMPORAL_MONTH_SUBJECT = Pattern.compile("^이(?:랑|\\s*(?:지나|되|끝나|시작|오기|다가오))");
     private static final Pattern RELATIVE = Pattern.compile("(?:최근|지난)\\s*(\\d{1,2}|한|두|세|네|다섯)\\s*(일|주|개월|달)");
 
     public enum Route {
@@ -57,8 +65,7 @@ public record SearchHybridQuestion(
                 Normalizer.Form.NFKC
         );
         int count = recentCount(question);
-        DateRange dates = dates(question, reference.atZone(KOREA).toLocalDate());
-        return new SearchHybridQuestion(route(question, count), dates.from(), dates.before(), count);
+        return new SearchHybridQuestion(route(question, count), dates(question, reference.atZone(KOREA).toLocalDate()), count);
     }
 
     static Route classifyRoute(String raw) {
@@ -102,7 +109,7 @@ public record SearchHybridQuestion(
         return Route.MEETING_QUESTION;
     }
 
-    private static DateRange dates(
+    private static List<DateRange> dates(
             String question,
             LocalDate day
     ) {
@@ -110,40 +117,42 @@ public record SearchHybridQuestion(
             var iso = ISO_DATE.matcher(question);
             if (iso.find()) {
                 LocalDate first = LocalDate.parse(iso.group());
-                LocalDate last = first;
+                int firstEnd = iso.end();
                 if (iso.find()) {
-                    last = LocalDate.parse(iso.group());
+                    LocalDate last = LocalDate.parse(iso.group());
+                    return combine(days(first, first.plusDays(1)), days(last, last.plusDays(1)),
+                            question.substring(firstEnd, iso.start()));
                 }
-                return days(
-                        first,
-                        last.plusDays(1)
-                );
+                return List.of(days(first, first.plusDays(1)));
             }
             var calendar = MONTH_DAY.matcher(question);
-            if (calendar.find()) {
+            while (calendar.find()) {
                 String year = calendar.group(1);
                 String month = calendar.group(2);
+                String tail = question.substring(calendar.end());
+                if (calendar.group(3) == null && tail.startsWith("이")
+                        && !TEMPORAL_MONTH_SUBJECT.matcher(tail).find()) {
+                    continue;
+                }
                 DateRange first = monthOrDay(
                         year,
                         month,
                         calendar.group(3),
                         day.getYear()
                 );
-                var trailing = TRAILING_DAY.matcher(question.substring(calendar.end()));
+                var trailing = TRAILING_DAY.matcher(tail);
                 if (trailing.find()) {
                     DateRange last = monthOrDay(
                             year,
                             month,
-                            trailing.group(1),
+                            trailing.group(2),
                             day.getYear()
                     );
-                    return new DateRange(
-                            first.from(),
-                            last.before()
-                    );
+                    return combine(first, last, trailing.group(1));
                 }
+                int firstEnd = calendar.end();
                 if (!calendar.find()) {
-                    return first;
+                    return List.of(first);
                 }
                 DateRange last = monthOrDay(
                         calendar.group(1),
@@ -151,18 +160,20 @@ public record SearchHybridQuestion(
                         calendar.group(3),
                         day.getYear()
                 );
-                return new DateRange(
-                        first.from(),
-                        last.before()
-                );
+                return combine(first, last, question.substring(firstEnd, calendar.start()));
             }
-            return relativeDates(
-                    question,
-                    day
-            );
+            DateRange relative = relativeDates(question, day);
+            return relative.from() == null ? List.of() : List.of(relative);
         } catch (java.time.DateTimeException | IllegalArgumentException invalidDate) {
             throw new SearchToolException("INVALID_TOOL_ARGUMENTS");
         }
+    }
+
+    private static List<DateRange> combine(DateRange first, DateRange last, String connector) {
+        if (DATE_CONJUNCTION.matcher(connector).matches()) {
+            return List.of(first, last);
+        }
+        return List.of(new DateRange(first.from(), last.before()));
     }
 
     private static DateRange monthOrDay(
@@ -284,11 +295,11 @@ public record SearchHybridQuestion(
         );
     }
 
-    private record DateRange(
+    public record DateRange(
             Instant from,
             Instant before
     ) {
-        private DateRange {
+        public DateRange {
             if (from != null && before != null && !from.isBefore(before)) {
                 throw new IllegalArgumentException("Reversed date range");
             }

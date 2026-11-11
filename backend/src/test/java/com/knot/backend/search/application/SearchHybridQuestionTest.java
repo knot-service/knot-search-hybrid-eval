@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.knot.backend.search.application.SearchHybridQuestion.Route;
+import com.knot.backend.search.application.SearchHybridQuestion.DateRange;
 import com.knot.backend.search.domain.SearchToolException;
 import java.time.Instant;
 import org.junit.jupiter.api.Test;
@@ -38,8 +39,7 @@ class SearchHybridQuestionTest {
                 "10월 1일부터 15일까지 로그인 논의를 모아줘",
                 REFERENCE
         );
-        assertThat(parsed.recordedFrom()).isEqualTo(Instant.parse("2026-09-30T15:00:00Z"));
-        assertThat(parsed.recordedBefore()).isEqualTo(Instant.parse("2026-10-15T15:00:00Z"));
+        assertThat(parsed.recordedDates()).containsExactly(range("2026-09-30T15:00:00Z", "2026-10-15T15:00:00Z"));
     }
 
     @Test
@@ -48,8 +48,26 @@ class SearchHybridQuestionTest {
                 "지난주 배포 회의 찾아줘",
                 REFERENCE
         );
-        assertThat(parsed.recordedFrom()).isEqualTo(Instant.parse("2026-11-01T15:00:00Z"));
-        assertThat(parsed.recordedBefore()).isEqualTo(Instant.parse("2026-11-08T15:00:00Z"));
+        assertThat(parsed.recordedDates()).containsExactly(range("2026-11-01T15:00:00Z", "2026-11-08T15:00:00Z"));
+    }
+
+    @Test
+    void selectsOnlyTheTwoMentionedDays() {
+        var parsed = SearchHybridQuestion.parse("10월 22일이랑 25일 회의 비교해 줘", REFERENCE);
+        assertThat(parsed.recordedDates()).containsExactly(
+                range("2026-10-21T15:00:00Z", "2026-10-22T15:00:00Z"),
+                range("2026-10-24T15:00:00Z", "2026-10-25T15:00:00Z"));
+    }
+
+    @Test
+    void distinguishesTheNameFromJune() {
+        assertThat(SearchHybridQuestion.parse("6월이가 맡긴 업무는?", REFERENCE).recordedDates()).isEmpty();
+        assertThat(SearchHybridQuestion.parse("6월 회의에서 맡긴 업무는?", REFERENCE).recordedDates())
+                .containsExactly(range("2026-05-31T15:00:00Z", "2026-06-30T15:00:00Z"));
+    }
+
+    private static DateRange range(String from, String before) {
+        return new DateRange(Instant.parse(from), Instant.parse(before));
     }
 
     @Test

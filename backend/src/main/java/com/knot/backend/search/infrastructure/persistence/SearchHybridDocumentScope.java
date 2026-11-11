@@ -5,6 +5,7 @@ import com.knot.backend.search.application.SearchToolScope;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
@@ -25,8 +26,7 @@ public class SearchHybridDocumentScope {
                 WHERE d.workspace_id = :workspace AND r.workspace_id = :workspace
                   AND d.status IN ('DRAFT', 'ARCHIVED') AND d.created_at <= :cutoff
                   AND r.started_at <= :cutoff
-                  AND (CAST(:from AS timestamptz) IS NULL OR r.started_at >= :from)
-                  AND (CAST(:before AS timestamptz) IS NULL OR r.started_at < :before)
+                  AND (CAST(:dates AS tstzmultirange) IS NULL OR r.started_at <@ CAST(:dates AS tstzmultirange))
                 ORDER BY r.started_at DESC, d.id DESC
                 """)
                 .param(
@@ -38,12 +38,8 @@ public class SearchHybridDocumentScope {
                         Timestamp.from(scope.startedAt())
                 )
                 .param(
-                        "from",
-                        timestamp(question.recordedFrom())
-                )
-                .param(
-                        "before",
-                        timestamp(question.recordedBefore())
+                        "dates",
+                        recordedDates(question)
                 )
                 .query(
                         (
@@ -59,11 +55,13 @@ public class SearchHybridDocumentScope {
                 .list();
     }
 
-    private Timestamp timestamp(Instant value) {
-        if (value == null) {
+    private String recordedDates(SearchHybridQuestion question) {
+        if (question.recordedDates().isEmpty()) {
             return null;
         }
-        return Timestamp.from(value);
+        return question.recordedDates().stream()
+                .map(date -> "[" + date.from() + "," + date.before() + ")")
+                .collect(Collectors.joining(",", "{", "}"));
     }
 
     public record EligibleDocument(
