@@ -8,7 +8,8 @@ from pathlib import Path
 from threading import Lock
 
 from phase4_retrieval import (
-    BASELINE, SPARE_SLOT_SETTINGS, SUPPORTING_DOCUMENT_SETTINGS, RankRequest, RetrievalSettings, app, lifespan,
+    BASELINE, SPARE_SLOT_SETTINGS, SUPPORTING_DOCUMENT_SETTINGS, SUPPORTING_SELECTION_SETTINGS,
+    RankRequest, RetrievalSettings, app, lifespan,
 )
 from phase5_eval import FIND, SYNTHESIS
 from quality1_eval import SYNTHETIC_SPANS, span_match, synthetic_match
@@ -382,9 +383,62 @@ def explain_supporting_misses(replay, root):
     print(dict(Counter(row["reason"] for row in audit)), dict(Counter(row["supportRank"] for row in audit)), flush=True)
 
 
+def compare_protected_support(replay, root):
+    previous = read(root / "supporting-selection.json")
+    rrf10 = next(trial for trial in previous["trials"] if (
+        trial["settings"]["supporting_rrf_bonus"] == 10
+        and trial["settings"]["supporting_lexical_bonus"] == 0
+        and not trial["settings"]["supporting_extra_per_meeting"]
+    ))
+    spring = read(root / "support-select-candidate/phase5-spring-report.json")["replay"]
+    by_case = {row["caseId"]: row["passages"] for row in spring if row["workspaceId"] == 1}
+    target = {tuple(span) for span in previous["target"]
+              if not any(p["documentId"] == span[1] for p in by_case[span[0]])}
+    assert len(target) == 38
+    control = SUPPORTING_SELECTION_SETTINGS
+    causes = []
+    regression_cases = {span[0] for span in rrf10["lost"]["1"]}
+    questions = {c["id"]: c["question"] for w in replay.workspaces if w["id"] == 1 for c in w["cases"]}
+    scopes, _ = replay.requests("dates")
+    retriever = replay.state.retrievers[1]
+    for case in sorted(regression_cases):
+        question = questions[case]
+        scope = scopes[1, sha256(question.encode()).hexdigest()].model_copy(update={"question": question})
+        keyword, vector = replay.rank_sources(scope, control.keyword_depth, control.vector_depth)
+        candidates = fuse(keyword, vector, control.fusion_depth, control.fusion_reserve)
+        ranking = retriever.with_context(scope, candidates, replay.reranker, replay.lock, replay.lock,
+                                         RetrievalSettings.model_validate(rrf10["settings"]))
+        for span in rrf10["lost"]["1"]:
+            if span[0] == case:
+                same_document = [p for p in ranking.supportingPassages if p.documentId == span[1]]
+                reason = ("document_replaced" if not same_document else
+                          "body_to_summary" if all(p.field == "summary" for p in same_document) else "window_shifted")
+                causes.append({"span": span, "reason": reason})
+
+    baseline, before = replay.run(control, "dates")
+    assert baseline[1]["matched"] == 411
+    trials = []
+    for weight, reserve in ((2, 0), (5, 0), (10, 0), (20, 0), (5, 64), (10, 96), (5, 96), (10, 128)):
+        config = control.model_copy(update={"extra_support_rrf_bonus": weight, "extra_support_reserve_tokens": reserve})
+        stats, after = replay.run(config, "dates")
+        result = {"settings": config.model_dump(), "stats": stats, "targetRecovered": len(target & after[1]),
+                  **changed_spans(before, after)}
+        trials.append(result)
+        print(weight, reserve, stats[1]["matched"], compare(before, after), result["targetRecovered"], flush=True)
+    budget_exhausted = sum(sum(p["tokenCount"] for p in by_case[case]) == control.context_budget
+                           for case, *_ in target)
+    (root / "protected-support.json").write_text(json.dumps({
+        "baseline": baseline, "target": sorted(target), "budgetExhausted": budget_exhausted,
+        "rrf10Regression": causes, "trials": trials,
+    }, indent=2) + "\n")
+
+
 async def run(root, stage):
     async with lifespan(app):
         replay = Replay(root, app.state)
+        if stage == "protected-support":
+            compare_protected_support(replay, root)
+            return
         if stage == "supporting-selection-causes":
             explain_supporting_misses(replay, root)
             return
@@ -488,6 +542,7 @@ if __name__ == "__main__":
         "selection", "remaining", "followup", "supplement-overlap",
         "meeting-representatives", "meeting-representatives-rrf", "meeting-representatives-refine", "supporting-documents",
         "supporting-selection", "supporting-selection-shared", "supporting-selection-light", "supporting-selection-causes",
+        "protected-support",
     ))
     args = parser.parse_args()
     asyncio.run(run(args.root, args.stage))
