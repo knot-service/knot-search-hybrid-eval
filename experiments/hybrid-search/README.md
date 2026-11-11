@@ -519,3 +519,42 @@ Lab에는 마지막 균등 실행 디렉터리의 `phase6-aging-threshold-sweep.
 내용 질문 지연을 우선한다면 4초를 다음 실험 기준으로 추천한다. 균등 6건에서 내용 질문 대기 p95/p99가 기존 0.096/0.105초에 가까운 0.103/0.115초였고, 집중 부하의 대기 p95/p99는 기존 1.605/2.312초와 비교해 1.478/1.782초였다. 다만 이 집중 부하에서 4초는 종합을 마지막 내용 질문보다 앞당기지 않았고, 종합 첫 SSE p95는 8.935 → 9.519초였다. 4초는 더 오래 지속되는 대기를 제한하는 후보이며 짧은 집중 부하를 해결했다고 볼 수 없다. 설정 기본값은 유지한다.
 
 각 기준에서 180/180건이 완료됐고 문서 찾기 48건의 생성·분류 모델 호출은 각각 0회였다. Workspace 458의 기대 회의 인용은 균등에서 36/36 → 32/36 → 36/36 → 36/36건, 집중에서 28/30 → 30/30 → 30/30 → 30/30건이었다. 3·4초 모두 기대 회의가 검색 문맥에서 줄어든 요청은 없었고, S18-01의 기대 문서는 균등 6/6건과 집중 2/2건에서 최종 인용됐다. 표시 인용은 3초 균등 62/62·집중 52/52개, 4초 균등 73/73·집중 53/53개가 원문 및 저장 출처와 일치했다.
+
+### 6차 후속: 4초 이후에도 내용 질문이 쌓이는 부하
+
+같은 두 워크스페이스에서 내용 질문 우선 정책과 4초 종합 승격을 각각 새로 실행한다. 생성 슬롯은 2개, 문서 찾기 슬롯은 1개다. 회차마다 내용 질문 8건, 회의 종합 1건, 문서 찾기 1건을 계획하고 SSE 요청은 최대 8건을 열어 둔다. 시작 시 내용 질문 4건, 250ms에 종합과 문서 찾기, 1초·2.2초·4.5초·5.8초에 내용 질문을 1건씩 보낸다. 앞 회차의 모든 SSE가 종료된 뒤 다음 회차를 시작하며 12회 반복한다. 지연은 각 HTTP 요청을 실제 발송한 시점부터 측정한다.
+
+종합 접수 후 4초에 종합과 내용 질문이 모두 대기 중이었는지 확인한다. 그 시점에 이미 대기하던 질문보다 종합이 먼저 Worker를 받은 회차를 따로 집계한다. 예약 발송 시각과 별개로, 실제로 4초 이후에 접수된 내용 질문이 있었는지도 확인한다. 이 판정에는 DB 접수 시각과 같은 답변 ID의 Worker 대기 로그를 사용한다. 회차당 요청이 10건이라는 값은 동시 SSE 연결 수를 뜻하지 않는다.
+
+5차 검색 서비스와 기존 LLM·Docker 환경을 준비한 뒤 저장소 루트에서 실행한다.
+
+```sh
+root="$PWD"
+local_dir="$root/experiments/hybrid-search/.local"
+cd "$root/backend"
+for wait_limit in 0s 4s; do
+  run_dir="$local_dir/phase6-aging-sustained-$wait_limit"
+  mkdir -p -m 700 "$run_dir"
+  cp -p "$local_dir/phase5-fixtures.json" "$run_dir/phase5-fixtures.json"
+  KNOT_PHASE5_FIXTURES="$run_dir/phase5-fixtures.json" KNOT_PHASE6_LOAD=true KNOT_PHASE6_WAVES=12 \
+    KNOT_PHASE6_LOAD_PATTERN=question_sustained SEARCH_LOOKUP_WORKER_CONCURRENCY=1 \
+    SEARCH_SPLIT_GENERATION_ROUTES=true SEARCH_SHARE_GENERATION_SLOTS=true \
+    SEARCH_SYNTHESIS_PROMOTION_WAIT="$wait_limit" \
+    ./gradlew integrationTest --rerun --tests '*SearchHybridDatasetReplayTest.measuresMixedConcurrentSse' || exit 1
+  install -m 600 build/test-results/integrationTest/TEST-com.knot.backend.search.application.SearchHybridDatasetReplayTest.xml "$run_dir/worker.xml"
+done
+cd "$root/experiments/hybrid-search"
+python phase6_sustained.py phase6-aging-sustained-0s phase6-aging-sustained-4s
+```
+
+Lab에는 집계만 담은 `phase6-sustained-comparison.json`을 게시한다.
+
+| 경로 | Worker 대기 p95/p99 (초) | 첫 SSE p95/p99 (초) | 완료 p95/p99 (초) |
+| --- | ---: | ---: | ---: |
+| 문서 찾기 | 0.109/0.109 → 0.109/0.109 | 0.262/0.262 → 0.265/0.265 | 0.262/0.262 → 0.265/0.265 |
+| 내용 질문 | 4.980/6.319 → 7.574/7.865 | 7.922/9.305 → 11.081/13.534 | 7.922/9.306 → 11.082/13.645 |
+| 회의 종합 | 11.348/11.348 → 5.715/5.715 | 15.088/15.088 → 12.556/12.556 | 15.088/15.088 → 12.556/12.556 |
+
+순서는 기존 내용 질문 우선 → 4초 종합 승격이다. 두 정책 모두 12/12회에서 종합 접수 4초 이후에 내용 질문이 실제 접수됐고, 4초 시점에 종합과 내용 질문이 함께 대기했다. 종합이 그때 이미 대기 중이던 질문보다 먼저 시작한 회차는 0/12 → 12/12회였다. 생성 Worker 스레드는 두 개씩이었고 지정 슬롯과 120/120건 일치했다. 종합의 대기 p95는 11.348 → 5.715초였고 내용 질문의 대기 p95는 4.980 → 7.574초였다. 기준을 넘긴 뒤에도 실행 중인 생성이 끝나야 다음 슬롯이 열린다. 경로별 표본은 12·96건이며 p99는 관측 최댓값이다.
+
+두 정책에서 각각 120/120건이 완료됐다. 문서 찾기 12건의 생성·분류 모델 호출은 양쪽 모두 0회였다. Workspace 458에서 기대 회의가 검색 문맥에서 줄어든 사례는 0/54건이었다. 기대 회의를 모두 최종 인용한 답변은 54/54 → 52/54건이었다. 누락 2건은 S18-01이었고, 기대 문서는 양쪽 모두 2/2건에서 문맥에 있었다. 표시한 인용은 88/88 → 56/56개가 원문과 저장 출처에 일치했다. 생성 설정은 동일하므로 인용 차이를 슬롯 배정의 효과로 단정하지 않는다.

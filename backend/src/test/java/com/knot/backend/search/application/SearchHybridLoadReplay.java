@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import tools.jackson.databind.ObjectMapper;
 
@@ -30,8 +31,19 @@ final class SearchHybridLoadReplay {
             List<HttpRequest> requests,
             List<Long> dispatchDelayMs
     ) throws Exception {
+        return wave(http, mapper, requests, dispatchDelayMs, requests.size());
+    }
+
+    static List<Sample> wave(
+            HttpClient http,
+            ObjectMapper mapper,
+            List<HttpRequest> requests,
+            List<Long> dispatchDelayMs,
+            int maxInFlight
+    ) throws Exception {
         CountDownLatch ready = new CountDownLatch(requests.size());
         CountDownLatch start = new CountDownLatch(1);
+        Semaphore inFlight = new Semaphore(maxInFlight, true);
         try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
             List<Future<Sample>> results = new ArrayList<>();
             for (int index = 0; index < requests.size(); index++) {
@@ -43,11 +55,12 @@ final class SearchHybridLoadReplay {
                     if (delay > 0) {
                         Thread.sleep(delay);
                     }
-                    return read(
-                            http,
-                            mapper,
-                            request
-                    );
+                    inFlight.acquire();
+                    try {
+                        return read(http, mapper, request);
+                    } finally {
+                        inFlight.release();
+                    }
                 }));
             }
             try {

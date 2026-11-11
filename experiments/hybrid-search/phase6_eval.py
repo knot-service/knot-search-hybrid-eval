@@ -68,8 +68,8 @@ def worker_timings(path: Path, summary: dict) -> None:
             route["workerRetrievalP95Ms"] = sorted(retrieval[answer][1] for answer in matching)[rank]
 
 
-def sample_key(row: dict) -> tuple[int, int, int, str]:
-    return row["concurrency"], row["wave"], row["workspaceId"], row["caseId"]
+def sample_key(row: dict) -> tuple[int, int, int, str, int | None]:
+    return row["concurrency"], row["wave"], row["workspaceId"], row["caseId"], row.get("wavePosition")
 
 
 def summarize(log_path: Path | None = None, run_dir: Path = Path("."), *, compare_shared: bool = True) -> dict:

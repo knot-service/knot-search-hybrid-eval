@@ -276,9 +276,11 @@ class SearchHybridDatasetReplayTest {
                 100
         );
         String loadPattern = System.getenv().getOrDefault("KNOT_PHASE6_LOAD_PATTERN", "balanced");
-        assertThat(loadPattern).isIn("balanced", "question_surge");
+        assertThat(loadPattern).isIn("balanced", "question_surge", "question_sustained");
         boolean surge = loadPattern.equals("question_surge");
-        List<Integer> levels = surge ? List.of(6) : List.of(3, 6);
+        boolean sustained = loadPattern.equals("question_sustained");
+        List<Long> sustainedDelays = List.of(0L, 0L, 0L, 0L, 250L, 250L, 1000L, 2200L, 4500L, 5800L);
+        List<Integer> levels = sustained ? List.of(sustainedDelays.size()) : surge ? List.of(6) : List.of(3, 6);
         List<LoadSample> samples = new ArrayList<>();
         try (HttpClient http = HttpClient.newHttpClient()) {
             List<LoadQuestion> warmup = questions(
@@ -299,9 +301,12 @@ class SearchHybridDatasetReplayTest {
             observed.clear();
             for (int concurrency : levels) {
                 for (int wave = 0; wave < waves; wave++) {
-                    List<LoadQuestion> questions = surge ? surgeQuestions(dataset, wave) : questions(dataset, concurrency, wave);
+                    List<LoadQuestion> questions = sustained ? sustainedQuestions(dataset, wave)
+                            : surge ? surgeQuestions(dataset, wave) : questions(dataset, concurrency, wave);
                     List<HttpRequest> batch = requests(questions, members);
-                    var events = surge
+                    var events = sustained
+                            ? SearchHybridLoadReplay.wave(http, mapper, batch, sustainedDelays, workerProperties.getStreamConcurrency())
+                            : surge
                             ? SearchHybridLoadReplay.wave(http, mapper, batch, List.of(0L, 0L, 300L, 300L, 800L, 1200L))
                             : SearchHybridLoadReplay.wave(http, mapper, batch);
                     for (int index = 0; index < events.size(); index++) {
@@ -309,6 +314,7 @@ class SearchHybridDatasetReplayTest {
                                 new LoadSample(
                                         concurrency,
                                         wave,
+                                        sustained ? index : null,
                                         questions.get(index),
                                         events.get(index)
                                 )
@@ -369,10 +375,14 @@ class SearchHybridDatasetReplayTest {
                     .param("id", event.answerId()).query(Boolean.class).optional().orElse(false);
             boolean questionOnly = jdbc.sql("SELECT question_only FROM search_answer_executions WHERE answer_id = :id")
                     .param("id", event.answerId()).query(Boolean.class).optional().orElse(false);
+            Long acceptedAtMs = sustained ? jdbc.sql("SELECT created_at FROM search_answer_executions WHERE answer_id = :id")
+                    .param("id", event.answerId()).query(Timestamp.class).single().toInstant().toEpochMilli() : null;
             results.add(
                     new LoadObservation(
                             sample.concurrency(),
                             sample.wave(),
+                            sample.wavePosition(),
+                            acceptedAtMs,
                             question.workspaceId(),
                             item.id(),
                             item.route(),
@@ -419,6 +429,7 @@ class SearchHybridDatasetReplayTest {
                                 workerProperties.isShareGenerationSlots(),
                                 workerProperties.getSynthesisPromotionWait().toMillis(),
                                 loadPattern,
+                                sustained ? sustainedDelays : List.of(),
                                 workerProperties.getStreamConcurrency(),
                                 workerProperties.getPollInterval()
                                         .toMillis(),
@@ -479,6 +490,20 @@ class SearchHybridDatasetReplayTest {
                 loadQuestion(dataset, Route.MEETING_QUESTION, offset + 3, 1));
     }
 
+    private List<LoadQuestion> sustainedQuestions(Dataset dataset, int wave) {
+        List<LoadQuestion> questions = new ArrayList<>();
+        int offset = wave * 2;
+        for (int index = 0; index < 4; index++) {
+            questions.add(loadQuestion(dataset, Route.MEETING_QUESTION, offset + index, 1));
+        }
+        questions.add(loadQuestion(dataset, Route.MULTI_MEETING_SYNTHESIS, wave, 2));
+        questions.add(loadQuestion(dataset, Route.DOCUMENT_FIND, wave, 0));
+        for (int index = 4; index < 8; index++) {
+            questions.add(loadQuestion(dataset, Route.MEETING_QUESTION, offset + index, 1));
+        }
+        return questions;
+    }
+
     private LoadQuestion loadQuestion(Dataset dataset, Route route, int occurrence, int routeOffset) {
         int workspaceCount = dataset.workspaces().size();
         Workspace workspace = dataset.workspaces().get((occurrence + routeOffset) % workspaceCount);
@@ -512,6 +537,7 @@ class SearchHybridDatasetReplayTest {
     private record LoadSample(
             int concurrency,
             int wave,
+            Integer wavePosition,
             LoadQuestion question,
             SearchHybridLoadReplay.Sample event
     ) {
@@ -520,6 +546,8 @@ class SearchHybridDatasetReplayTest {
     private record LoadObservation(
             int concurrency,
             int wave,
+            Integer wavePosition,
+            Long acceptedAtMs,
             long workspaceId,
             String caseId,
             Route expectedRoute,
@@ -549,6 +577,7 @@ class SearchHybridDatasetReplayTest {
             boolean shareGenerationSlots,
             long synthesisPromotionWaitMs,
             String loadPattern,
+            List<Long> plannedDispatchDelaysMs,
             int streamConcurrency,
             long pollIntervalMs,
             List<LoadObservation> requests
