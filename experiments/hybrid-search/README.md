@@ -614,3 +614,26 @@ S18-01의 문맥에서 배포·폴더 구조 두 문서는 기존 939토큰 중 
 python quality1_eval.py <before-dir> <after-dir> <semantic-review.json> \
   --load-before <before-load-report.json> --load-after <after-load-report.json>
 ```
+
+## 서빙 준비 · 문서 변경을 색인에 반영
+
+Spring이 사용하는 PostgreSQL에 Flyway V57을 적용하면 기존 문서별 색인 작업을 만들고, 문서의 생성·수정·삭제를 같은 트랜잭션에서 기록한다. 작업 테이블은 본문 사본 없이 최신 원본 버전과 색인 버전을 보관한다. 검색 사이드카는 문서를 읽어 기존 E5·고정 청킹으로 벡터를 만들고, 작업 버전이 여전히 최신일 때만 새 청크와 색인 버전을 함께 커밋한다. 삭제 시 청크를 지우고 마지막 버전 번호를 보존한다.
+
+검색은 원본 버전과 색인 버전이 같은 문서만 사용한다. 수정 대기 중에는 해당 문서가 잠시 결과에서 빠진다. 사이드카는 같은 PostgreSQL 스냅샷에서 검색 가능한 문서, BM25 입력과 벡터를 읽는다. Spring에서 전달한 허용 문서 ID도 검색 범위에 적용한다.
+
+### 실행과 확인
+
+- 사이드카의 `KNOT_HYBRID_LIVE_DSN`에는 Spring과 같은 PostgreSQL의 접속 정보를 설정한다. `KNOT_HYBRID_LIVE_WORKSPACES`에는 내부 공개 대상 ID를 쉼표로 구분해 설정한다. pgvector가 설치돼 있어야 하며 실행 계정에는 문서·녹음 세션 조회와 색인 작업·청크 테이블 처리 권한이 필요하다. DSN이 없으면 스냅샷 모드로 실행한다.
+- Spring의 `knot.search.hybrid.index-url`과 `knot.search.hybrid.workspaces`를 사이드카의 루프백 주소와 같은 대상에 맞춘다. [490/526 기준선 설정](accuracy-improvement-plan.md#검색-범위-확장과-추가-후보-리랭킹)을 적용하고, 후속 회의 핵심 구절·회의 ID 실험 설정은 기본값을 쓴다.
+- 내부 활성화 전에 아래 쿼리로 작업이 비었는지 확인한다. 실패 행은 마지막 실패 이후 다음 처리 시각에 재시도된다. 문서별 마지막 버전 행은 삭제 후 늦게 도착한 작업의 재적용을 막으므로 유지한다.
+
+```sql
+SELECT workspace_id, count(*) AS pending,
+       count(*) FILTER (WHERE failures > 0) AS retrying,
+       min(retry_at) AS next_retry_at
+FROM hybrid_document_index_jobs
+WHERE source_version > indexed_version
+GROUP BY workspace_id;
+```
+
+- 통합 테스트는 `KNOT_PHASE5_LIVE_PYTHON`에 검색 사이드카 가상환경 Python 경로, `KNOT_PHASE5_INDEX_URL`에 비어 있는 로컬 포트의 `/rank`, `KNOT_PHASE5_FIXTURES`에 평가 자료 경로를 지정한다. `SearchHybridDatasetReplayTest.verifiesLiveIndexLifecycle`에서 생성·수정·삭제와 중복·지연 작업을 확인하고, 기존 검색 재생·SSE 테스트를 같은 모드에서 실행할 수 있다. 테스트는 Testcontainers의 격리 PostgreSQL에 사이드카를 연결한다.
