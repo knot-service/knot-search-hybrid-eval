@@ -144,6 +144,18 @@ def prepare(db: Connection, docs: tuple[SourceDoc, ...], model: SentenceTransfor
             )
     return {mode: len(children) for mode, children in by_mode.items()}
 
+def rank_quality(case: DraftCase, ranked: tuple[int, ...], hits: tuple[Hit, ...]) -> tuple[float, float, float]:
+    expected = set(case.expectedEvidenceIds)
+    dcg = sum(1 / log2(rank + 2) for rank, doc_id in enumerate(ranked[:5]) if doc_id in expected)
+    ideal = sum(1 / log2(rank + 2) for rank in range(min(len(expected), 5)))
+    matched = [any(
+        hit.documentId == evidence.documentId and hit.field == evidence.field
+        and hit.start <= evidence.startOffset and hit.end >= evidence.endOffset
+        for hit in hits
+    ) for evidence in case.evidence]
+    return len(expected.intersection(ranked[:10])) / len(expected), dcg / ideal, mean(matched)
+
+
 
 def score(
     db: Connection, mode: IndexMode, case: DraftCase, vector: str, embedding_ms: float,
@@ -158,17 +170,10 @@ def score(
     hits = tuple(Hit(documentId=doc_id, field=field, start=left, end=right)
                  for doc_id, field, left, right in records[:10])
     search_ms = (perf_counter() - start) * 1000
-    expected = set(case.expectedEvidenceIds)
-    dcg = sum(1 / log2(rank + 2) for rank, doc_id in enumerate(ranked[:5]) if doc_id in expected)
-    ideal = sum(1 / log2(rank + 2) for rank in range(min(len(expected), 5)))
-    matched = [any(
-        hit.documentId == evidence.documentId and hit.field == evidence.field
-        and hit.start <= evidence.startOffset and hit.end >= evidence.endOffset
-        for hit in hits
-    ) for evidence in case.evidence]
+    recall, ndcg, span = rank_quality(case, ranked, hits)
     return Result(
-        caseId=case.id, variantLabel=case.variantLabel, mode=mode, documentRecallAt10=len(expected.intersection(ranked)) / len(expected),
-        ndcgAt5=dcg / ideal, evidenceSpanRecallAt10=mean(matched) if mode != "document" else None,
+        caseId=case.id, variantLabel=case.variantLabel, mode=mode, documentRecallAt10=recall,
+        ndcgAt5=ndcg, evidenceSpanRecallAt10=span if mode != "document" else None,
         embeddingMs=embedding_ms, searchMs=search_ms, rankedDocumentIds=ranked, rankedChunks=hits,
     )
 
