@@ -68,6 +68,27 @@ class WorkerContextTest(TestCase):
         self.assertEqual(target, body[result.short[0].hit.start:result.short[0].hit.end])
         self.assertLessEqual(sum(item.tokenCount for item in (*result.passages, *result.short)), existing.end)
 
+    def test_topic_and_status_must_appear_in_the_same_sentence(self):
+        original = "회의를 시작한다."
+        unrelated = "홍보 진행 방식은 확정했다."
+        target = "카카오 로그인 도입 여부는 아직 미정이다."
+        body = f"{original}\n카카오 로그인도 언급했다. {unrelated}\n{target}"
+        source = {1: document(1, body)}
+        hit = Hit(documentId=1, field="body", start=0, end=len(original))
+
+        def tokenizer(text: str, **_options: bool) -> dict[str, list[str]]:
+            return {"input_ids": list(text)}
+
+        result = reserve_meeting_evidence(
+            "카카오 로그인 도입 여부는 어떻게 결정됐어?",
+            (Context(hit=hit, tokenCount=len(original)),), (), source, tokenizer,
+            budget=len(original) + len(target), reclaim=0, require_topic_status=True,
+        )
+
+        self.assertEqual(1, len(result.short))
+        selected = result.short[0].hit
+        self.assertEqual(target, body[selected.start:selected.end])
+
     def test_reserved_short_passage_selects_a_separate_excerpt_from_a_selected_document(self):
         original = "회의 시작"
         target = "결제 승인 조건은 영수증 확인이다."

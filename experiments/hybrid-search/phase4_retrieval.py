@@ -86,6 +86,7 @@ class RetrievalSettings(Frozen):
     discovery_excerpt_tokens: int = Field(default=96, ge=96, le=320)
     discovery_existing_first: bool = False
     meeting_evidence_first: bool = False
+    meeting_evidence_topic_status: bool = False
     meeting_evidence_reclaim: int = Field(default=0, ge=0, le=256)
 
 
@@ -733,6 +734,7 @@ def pack_meeting_evidence(question: str, result: RankResponse, retriever: Retrie
     packed = reserve_meeting_evidence(
         question, flat, short, retriever.source, retriever.tokenizer,
         budget=settings.expansion_budget, reclaim=settings.meeting_evidence_reclaim,
+        require_topic_status=settings.meeting_evidence_topic_status,
     )
     primary_end = len(result.passages)
     supporting_end = primary_end + len(result.supportingPassages)
@@ -803,6 +805,7 @@ async def lifespan(app: FastAPI):
             "discovery_excerpt_tokens": int(os.environ.get("KNOT_HYBRID_DISCOVERY_EXCERPT_TOKENS", "96")),
             "discovery_existing_first": os.environ.get("KNOT_HYBRID_DISCOVERY_EXISTING_FIRST") == "true",
             "meeting_evidence_first": os.environ.get("KNOT_HYBRID_MEETING_EVIDENCE_FIRST") == "true",
+            "meeting_evidence_topic_status": os.environ.get("KNOT_HYBRID_MEETING_EVIDENCE_TOPIC_STATUS") == "true",
             "meeting_evidence_reclaim": int(os.environ.get("KNOT_HYBRID_MEETING_EVIDENCE_RECLAIM", "0")),
         })
     elif os.environ.get("KNOT_HYBRID_EVIDENCE_SELECTION") == "true":
