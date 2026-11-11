@@ -92,11 +92,11 @@ class SourceMismatchError(ValueError):
     pass
 
 
-def documents() -> tuple[SourceDoc, ...]:
+def documents(workspace_id: int = 1) -> tuple[SourceDoc, ...]:
     with connect() as db:
         rows = db.execute(
             "select id,meeting_id,recorded_at,title,topic,summary,body "
-            "from documents where workspace_id=1 order by recorded_at,id"
+            "from documents where workspace_id=%s order by recorded_at,id", (workspace_id,)
         ).fetchall()
     return tuple(SourceDoc(id=doc_id, meetingId=meeting_id, recordedAt=recorded.isoformat(),
                            title=title, topic=topic, summary=summary, body=body)

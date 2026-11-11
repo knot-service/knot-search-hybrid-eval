@@ -64,6 +64,14 @@ def diversify(ranking: tuple[Hit, ...]) -> tuple[Hit, ...]:
     return (*first_by_document.values(), *remaining)
 
 
+def fuse(keyword: tuple[Hit, ...], vector: tuple[Hit, ...]) -> tuple[Hit, ...]:
+    fused: dict[Hit, float] = {}
+    for hits in (keyword, vector):
+        for rank, hit in enumerate(hits, 1):
+            fused[hit] = fused.get(hit, 0.0) + 1 / (RRF_K + rank)
+    return tuple(sorted(fused, key=lambda hit: (-fused[hit], hit.documentId, hit.field, hit.start)))[:DEPTH]
+
+
 def measure(case: DraftCase, hits: tuple[Hit, ...], elapsed_ms: float) -> Ranking:
     ranked_documents = tuple(dict.fromkeys(hit.documentId for hit in hits))[:10]
     top_chunks = hits[:10]
@@ -102,11 +110,7 @@ def compare(
     keyword_ms = ms(start)
 
     start = perf_counter()
-    fused: dict[Hit, float] = {}
-    for hits in (keyword, vector):
-        for rank, hit in enumerate(hits, 1):
-            fused[hit] = fused.get(hit, 0.0) + 1 / (RRF_K + rank)
-    rrf = tuple(sorted(fused, key=lambda hit: (-fused[hit], hit.documentId, hit.field, hit.start)))[:DEPTH]
+    rrf = fuse(keyword, vector)
     fusion_ms = ms(start)
 
     start = perf_counter()

@@ -124,22 +124,26 @@ def chunks(doc: SourceDoc, mode: IndexMode, tokenizer: PreTrainedTokenizerFast) 
     return tuple(children)
 
 
-def prepare(db: Connection, docs: tuple[SourceDoc, ...], model: SentenceTransformer) -> dict[str, int]:
+def prepare(
+    db: Connection, docs: tuple[SourceDoc, ...], model: SentenceTransformer,
+    *, workspace_id: int = 1, modes: tuple[IndexMode, ...] = MODES,
+) -> dict[str, int]:
     tokenizer = model.tokenizer
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         raise SystemExit("The embedding tokenizer must return character offsets.")
-    by_mode = {mode: tuple(child for doc in docs for child in chunks(doc, mode, tokenizer)) for mode in MODES}
+    by_mode = {mode: tuple(child for doc in docs for child in chunks(doc, mode, tokenizer)) for mode in modes}
     with db.transaction(), db.cursor() as cursor:
         cursor.execute(SCHEMA)
-        cursor.execute("delete from workspace1_chunks where workspace_id=1")
+        cursor.execute("delete from workspace1_chunks where workspace_id=%s and mode=any(%s)",
+                       (workspace_id, list(modes)))
         for mode, children in by_mode.items():
             vectors = model.encode(
                 [f"passage: {child.text}" for child in children], batch_size=32,
                 normalize_embeddings=True, show_progress_bar=False,
             )
             cursor.executemany(
-                "insert into workspace1_chunks values (1,%s,%s,%s,%s,%s,%s::vector)",
-                [(mode, child.documentId, child.field, child.start, child.end, vector_literal(vector.tolist()))
+                "insert into workspace1_chunks values (%s,%s,%s,%s,%s,%s,%s::vector)",
+                [(workspace_id, mode, child.documentId, child.field, child.start, child.end, vector_literal(vector.tolist()))
                  for child, vector in zip(children, vectors, strict=True)],
             )
     return {mode: len(children) for mode, children in by_mode.items()}
