@@ -5,9 +5,11 @@ from datetime import date, datetime
 from hashlib import sha256
 import os
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from time import perf_counter
 from typing import Callable, Literal
+
+from psycopg import Connection
 from zoneinfo import ZoneInfo
 
 import torch
@@ -15,6 +17,7 @@ from fastapi import FastAPI, Request
 from pydantic import Field
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
+from starlette.datastructures import State
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from transformers import PreTrainedTokenizerFast
 
@@ -22,6 +25,7 @@ from build_dataset import Frozen, SourceDoc, documents
 from database import connect, vector_literal
 from experiment import MODEL, REVISION, tokens
 from evidence_expansion import compact_overlaps, expand_evidence
+from live_index import LiveIndex, live_documents, source_versions
 from meeting_evidence import reserve_meeting_evidence
 from phase1 import Hit, chunks, prepare
 from phase2 import DEPTH, fuse, ms
@@ -132,7 +136,7 @@ EVIDENCE_EXPANSION_SETTINGS = EVIDENCE_SELECTION_SETTINGS.model_copy(update={
 
 
 class RankRequest(Frozen):
-    workspaceId: Literal[1, 458]
+    workspaceId: int = Field(gt=0)
     question: str = Field(min_length=1, max_length=4000)
     allowedDocumentIds: tuple[int, ...] = Field(max_length=10_000)
     contextMode: Literal["none", "question", "synthesis"] = "none"
@@ -157,8 +161,9 @@ class RankResponse(Frozen):
 
 
 class Retriever:
-    def __init__(self, model: SentenceTransformer, workspace_id: int):
-        source = documents(workspace_id)
+    def __init__(self, model: SentenceTransformer, workspace_id: int, *,
+                 live_source: tuple[SourceDoc, ...] | None = None):
+        source = documents(workspace_id) if live_source is None else live_source
         if not source:
             raise RuntimeError(f"No snapshot for workspace {workspace_id}")
         tokenizer = model.tokenizer
@@ -171,6 +176,8 @@ class Retriever:
                               start=child.start, end=child.end) for child in units)
         self.keyword = BM25Okapi([tokens(child.text) for child in units])
         self.workspace_id = workspace_id
+        if live_source is not None:
+            return
         with connect() as db:
             existing = {Hit(documentId=doc, field=field, start=left, end=right)
                         for doc, field, left, right in db.execute(
@@ -182,10 +189,12 @@ class Retriever:
 
     def rank(self, question: str, embedding: str, allowed_ids: tuple[int, ...],
              settings: RetrievalSettings = BASELINE,
-             preferred_document_id: int | None = None) -> tuple[Hit, ...]:
+             preferred_document_id: int | None = None, *,
+             db: Connection | None = None) -> tuple[Hit, ...]:
         if preferred_document_id in allowed_ids:
             allowed_ids = (preferred_document_id,)
-        keyword, vector = self.rank_sources(question, embedding, allowed_ids, settings)
+        keyword, vector = (self.rank_sources(question, embedding, allowed_ids, settings) if db is None else
+                           self.rank_sources(question, embedding, allowed_ids, settings, db=db))
         return self.fuse_candidates(keyword, vector, settings)
 
     def fuse_candidates(self, keyword: tuple[Hit, ...], vector: tuple[Hit, ...],
@@ -212,16 +221,24 @@ class Retriever:
         return (*fused, *extras)
 
     def rank_sources(self, question: str, embedding: str, allowed_ids: tuple[int, ...],
-                     settings: RetrievalSettings) -> tuple[tuple[Hit, ...], tuple[Hit, ...]]:
-        allowed = set(allowed_ids)
-        with connect() as db:
-            vector = tuple(Hit(documentId=doc, field=field, start=left, end=right)
-                           for doc, field, left, right in db.execute(
-                """select document_id,field,start_offset,end_offset
-                   from workspace1_chunks where workspace_id=%s and mode='fixed' and document_id=any(%s)
-                   order by embedding <=> %s::vector,document_id,field,start_offset limit %s""",
-                (self.workspace_id, list(allowed), embedding, settings.vector_depth),
-            ))
+                     settings: RetrievalSettings, *, db: Connection | None = None
+                     ) -> tuple[tuple[Hit, ...], tuple[Hit, ...]]:
+        allowed = set(allowed_ids) & self.source.keys()
+        params = (self.workspace_id, list(allowed), embedding, settings.vector_depth)
+        if db is None:
+            with connect() as snapshot_db:
+                rows = snapshot_db.execute("""
+                    SELECT document_id, field, start_offset, end_offset
+                    FROM workspace1_chunks WHERE workspace_id=%s AND mode='fixed' AND document_id=any(%s)
+                    ORDER BY embedding <=> %s::vector,document_id,field,start_offset LIMIT %s
+                    """, params).fetchall()
+        else:
+            rows = db.execute("""
+                SELECT document_id, field, start_offset, end_offset
+                FROM hybrid_document_index_chunks WHERE workspace_id=%s AND document_id=any(%s)
+                ORDER BY embedding <=> %s::vector,document_id,field,start_offset LIMIT %s
+                """, params).fetchall()
+        vector = tuple(Hit(documentId=doc, field=field, start=left, end=right) for doc, field, left, right in rows)
         scores = self.keyword.get_scores(tokens(question))
         matching = (i for i, hit in enumerate(self.hits) if hit.documentId in allowed and scores[i] > 0)
         keyword = tuple(self.hits[i] for i in sorted(matching, key=lambda i: (-scores[i], i))[:settings.keyword_depth])
@@ -819,7 +836,21 @@ async def lifespan(app: FastAPI):
     elif os.environ.get("KNOT_HYBRID_EXPAND_CONTEXT") == "true":
         app.state.worker_settings = EXPANDED_REPRESENTATIVE_SETTINGS
     model = SentenceTransformer(MODEL, revision=REVISION, device="cpu")
-    app.state.retrievers = {workspace: Retriever(model, workspace) for workspace in (1, 458)}
+    dsn = os.environ.get("KNOT_HYBRID_LIVE_DSN")
+    live = None
+    if dsn:
+        workspace_ids = tuple(int(value) for value in os.environ.get("KNOT_HYBRID_LIVE_WORKSPACES", "").split(",") if value)
+        if not workspace_ids or any(value <= 0 for value in workspace_ids):
+            raise RuntimeError("Set KNOT_HYBRID_LIVE_WORKSPACES for the live index.")
+        live = LiveIndex(dsn, workspace_ids)
+        with live.connect() as db:
+            db.execute("SELECT 1 FROM hybrid_document_index_jobs LIMIT 1")
+        app.state.retrievers = {}
+        app.state.live_cache = {}
+        app.state.live_cache_lock = Lock()
+    else:
+        app.state.retrievers = {workspace: Retriever(model, workspace) for workspace in (1, 458)}
+    app.state.live_index = live
     model.encode(["query: 워밍업"], normalize_embeddings=True, show_progress_bar=False)
     app.state.model = model
     app.state.embed_lock = Lock()
@@ -834,7 +865,17 @@ async def lifespan(app: FastAPI):
         app.state.accuracy_trace_lock = Lock()
     else:
         app.state.accuracy_trace = None
-    yield
+    stop = Event()
+    worker = None
+    if live:
+        worker = Thread(target=live.run, args=(stop, model, app.state.embed_lock, model.tokenizer), daemon=True)
+        worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        if worker:
+            worker.join(timeout=5)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -853,15 +894,39 @@ def rank(data: RankRequest, request: Request) -> RankResponse:
     with request.app.state.embed_lock:
         query = request.app.state.model.encode([f"query: {data.question}"], normalize_embeddings=True,
                                                show_progress_bar=False)[0]
-    retriever = request.app.state.retrievers[data.workspaceId]
-    settings = BASELINE if data.contextMode == "none" else request.app.state.worker_settings
     embedding = vector_literal(query.tolist())
     state = request.app.state
+    live = state.live_index
+    if live is None:
+        retriever = state.retrievers.get(data.workspaceId)
+        return rank_with(data, state, retriever, embedding) if retriever else RankResponse(documentIds=())
+    if data.workspaceId not in live.workspaces:
+        return RankResponse(documentIds=())
+    # One snapshot covers the version check, BM25 source, and vector reads.
+    with live.connect() as db:
+        db.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        versions = source_versions(db, data.workspaceId)
+        if not versions:
+            return RankResponse(documentIds=())
+        with state.live_cache_lock:
+            cached = state.live_cache.get(data.workspaceId)
+            if cached is None or cached[0] != versions:
+                with state.embed_lock:
+                    retriever = Retriever(state.model, data.workspaceId, live_source=live_documents(db, data.workspaceId))
+                state.live_cache[data.workspaceId] = (versions, retriever)
+            else:
+                retriever = cached[1]
+        return rank_with(data, state, retriever, embedding, db=db)
+
+
+def rank_with(data: RankRequest, state: State, retriever: Retriever, embedding: str, *,
+              db: Connection | None = None) -> RankResponse:
+    settings = BASELINE if data.contextMode == "none" else state.worker_settings
     if settings.discovery_depth and data.contextMode == "synthesis":
         allowed = (data.preferredDocumentId,) if data.preferredDocumentId in data.allowedDocumentIds else data.allowedDocumentIds
         wide = settings.model_copy(update={"keyword_depth": max(settings.discovery_depth, settings.keyword_depth),
                                            "vector_depth": max(settings.discovery_depth, settings.vector_depth)})
-        keyword, vector = retriever.rank_sources(data.question, embedding, allowed, wide)
+        keyword, vector = retriever.rank_sources(data.question, embedding, allowed, wide, db=db)
         candidates = retriever.fuse_candidates(keyword[:settings.keyword_depth], vector[:settings.vector_depth], settings)
         baseline = retriever.with_context(data, candidates, state.reranker, state.rerank_lock, state.embed_lock, settings)
         result = retriever.discover(data.question, keyword, vector, candidates, baseline, state.reranker,
@@ -870,5 +935,6 @@ def rank(data: RankRequest, request: Request) -> RankResponse:
             with state.embed_lock:
                 return pack_meeting_evidence(data.question, result, retriever, settings)
         return result
-    candidates = retriever.rank(data.question, embedding, data.allowedDocumentIds, settings, data.preferredDocumentId)
+    candidates = retriever.rank(data.question, embedding, data.allowedDocumentIds, settings,
+                                data.preferredDocumentId, db=db)
     return retriever.with_context(data, candidates, state.reranker, state.rerank_lock, state.embed_lock, settings)

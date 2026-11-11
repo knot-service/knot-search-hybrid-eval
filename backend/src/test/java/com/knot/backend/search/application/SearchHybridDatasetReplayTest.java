@@ -16,6 +16,7 @@ import com.knot.backend.search.application.SearchHybridQuestion.Route;
 import com.knot.backend.search.application.dto.command.SearchQuestionCommand;
 import com.knot.backend.search.application.dto.result.SearchAnswerWorkResult;
 import com.knot.backend.search.application.dto.result.SearchDocumentResult;
+import com.knot.backend.search.infrastructure.llm.SearchHybridIndexClient;
 import com.knot.backend.search.infrastructure.llm.SearchLlmClient;
 import com.knot.backend.search.infrastructure.llm.SearchHybridIndexClient.Passage;
 import com.knot.backend.testsupport.TestApplicationProperties;
@@ -40,6 +41,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.DisabledIfEnvironmentVariable;
@@ -54,6 +57,7 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 import tools.jackson.databind.ObjectMapper;
 
 @Tag("integration")
@@ -89,6 +93,80 @@ class SearchHybridDatasetReplayTest {
     @LocalServerPort
     private int port;
 
+    @Autowired
+    private PostgreSQLContainer postgres;
+    @Autowired
+    private SearchHybridIndexClient index;
+    private Process liveSidecar;
+
+    @BeforeEach
+    void startLiveSidecar() throws Exception {
+        if (System.getenv("KNOT_PHASE5_LIVE_PYTHON") == null) {
+            return;
+        }
+        URI endpoint = URI.create(System.getenv("KNOT_PHASE5_INDEX_URL"));
+        ProcessBuilder sidecar = livePython("-m", "uvicorn", "phase4_retrieval:app", "--host", "127.0.0.1",
+                "--port", Integer.toString(endpoint.getPort()));
+        sidecar.redirectErrorStream(true).redirectOutput(
+                Path.of(System.getenv("KNOT_PHASE5_FIXTURES")).resolveSibling("live-sidecar.log").toFile());
+        liveSidecar = sidecar.start();
+        var check = HttpRequest.newBuilder(endpoint.resolve("/openapi.json")).timeout(Duration.ofSeconds(2)).build();
+        try (var http = HttpClient.newHttpClient()) {
+            long deadline = System.nanoTime() + Duration.ofSeconds(75).toNanos();
+            while (System.nanoTime() < deadline && liveSidecar.isAlive()) {
+                try {
+                    if (http.send(check, HttpResponse.BodyHandlers.discarding()).statusCode() == 200) {
+                        return;
+                    }
+                } catch (java.io.IOException ignored) {
+                    // The model may still be loading.
+                }
+                Thread.sleep(250);
+            }
+        }
+        throw new IllegalStateException("Live index did not start; see live-sidecar.log");
+    }
+
+    @AfterEach
+    void stopLiveSidecar() throws InterruptedException {
+        if (liveSidecar != null) {
+            liveSidecar.destroy();
+            if (!liveSidecar.waitFor(8, java.util.concurrent.TimeUnit.SECONDS)) {
+                liveSidecar.destroyForcibly();
+            }
+        }
+    }
+
+    private ProcessBuilder livePython(String... arguments) {
+        var command = new ArrayList<String>();
+        command.add(System.getenv("KNOT_PHASE5_LIVE_PYTHON"));
+        command.addAll(List.of(arguments));
+        var process = new ProcessBuilder(command).directory(Path.of("../experiments/hybrid-search").toFile());
+        process.environment().put("KNOT_HYBRID_LIVE_DSN",
+                "postgresql://%s:%s@%s:%d/%s".formatted(postgres.getUsername(), postgres.getPassword(),
+                        postgres.getHost(), postgres.getFirstMappedPort(), postgres.getDatabaseName()));
+        process.environment().put("KNOT_HYBRID_LIVE_WORKSPACES", "1,458");
+        return process;
+    }
+
+    private void awaitLiveIndex(long workspaceId) throws InterruptedException {
+        if (liveSidecar == null) {
+            return;
+        }
+        long deadline = System.nanoTime() + Duration.ofMinutes(4).toNanos();
+        while (System.nanoTime() < deadline && liveSidecar.isAlive()) {
+            long pending = jdbc.sql("""
+                    SELECT count(*) FROM hybrid_document_index_jobs
+                    WHERE workspace_id = :workspace AND source_version > indexed_version
+                    """).param("workspace", workspaceId).query(Long.class).single();
+            if (pending == 0) {
+                return;
+            }
+            Thread.sleep(250);
+        }
+        throw new IllegalStateException("Live index did not finish workspace " + workspaceId + "; see live-sidecar.log");
+    }
+
     @DynamicPropertySource
     static void configure(DynamicPropertyRegistry properties) {
         properties.add(
@@ -115,6 +193,10 @@ class SearchHybridDatasetReplayTest {
                             workspace
                     )
             );
+        }
+
+        for (Workspace workspace : dataset.workspaces()) {
+            awaitLiveIndex(workspace.id());
         }
 
         Map<Long, SearchHybridWorkflow.Result> observed = new ConcurrentHashMap<>();
@@ -598,7 +680,9 @@ class SearchHybridDatasetReplayTest {
         List<Observation> rows = new ArrayList<>();
         DocumentFixtures documents = new DocumentFixtures(jdbc);
         for (Workspace workspace : dataset.workspaces()) {
-            rows.addAll(replay(workspace, seed(documents, workspace)));
+            long member = seed(documents, workspace);
+            awaitLiveIndex(workspace.id());
+            rows.addAll(replay(workspace, member));
         }
         assertThat(mockingDetails(llm).getInvocations()).isEmpty();
         Path output = Files.createTempFile(fixture.getParent(), "retrieval-", ".json",
@@ -606,6 +690,78 @@ class SearchHybridDatasetReplayTest {
         mapper.writeValue(output.toFile(), rows);
         Files.move(output, fixture.resolveSibling("retrieval-report.json"),
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "KNOT_PHASE5_LIVE_PYTHON", matches = ".+")
+    void verifiesLiveIndexLifecycle() throws Exception {
+        Path fixture = Path.of(System.getenv("KNOT_PHASE5_FIXTURES"));
+        Workspace workspace = mapper.readValue(fixture.toFile(), Dataset.class).workspaces().getFirst();
+        Document original = workspace.documents().getFirst();
+        long documentId = original.id();
+        seed(new DocumentFixtures(jdbc), new Workspace(workspace.id(), workspace.version(), List.of(original), List.of()));
+        awaitLiveIndex(workspace.id());
+
+        assertThat(indexedVersions(documentId)).containsExactly(1L, 1L);
+        var first = index.rank(workspace.id(), original.title(), List.of(documentId), "question", 0, null, List.of());
+        assertThat(first.documentIds()).contains(documentId);
+        assertThat(first.passages()).isNotEmpty();
+        rejectVersion(workspace.id(), documentId, 1);
+
+        transaction.executeWithoutResult(status -> {
+            jdbc.sql("UPDATE documents SET content = '롤백되어야 하는 변경' WHERE id = :id").param("id", documentId).update();
+            status.setRollbackOnly();
+        });
+        jdbc.sql("UPDATE documents SET content = content WHERE id = :id").param("id", documentId).update();
+        assertThat(indexedVersions(documentId)).containsExactly(1L, 1L);
+
+        String amended = "검증용 개정 문서입니다. 질의응답 품질 검토는 매주 수요일 오전에 진행하기로 결정했습니다.";
+        transaction.executeWithoutResult(status -> {
+            jdbc.sql("UPDATE documents SET title = '질의응답 품질 검토', content = :body, summary = NULL WHERE id = :id")
+                    .param("id", documentId).param("body", amended).update();
+            jdbc.sql("UPDATE hybrid_document_index_jobs SET retry_at = now() + interval '10 minutes' WHERE document_id = :id")
+                    .param("id", documentId).update();
+        });
+        assertThat(indexedVersions(documentId)).containsExactly(2L, 1L);
+        rejectVersion(workspace.id(), documentId, 1);
+        assertThat(index.rank(workspace.id(), original.title(), List.of(documentId), "question", 0, null, List.of())
+                .documentIds()).isEmpty();
+        jdbc.sql("UPDATE hybrid_document_index_jobs SET retry_at = now() WHERE document_id = :id")
+                .param("id", documentId).update();
+        awaitLiveIndex(workspace.id());
+        assertThat(indexedVersions(documentId)).containsExactly(2L, 2L);
+        rejectVersion(workspace.id(), documentId, 1);
+        rejectVersion(workspace.id(), documentId, 2);
+        var updated = index.rank(workspace.id(), "질의응답 품질 검토는 언제 진행해?", List.of(documentId), "question", 0, null, List.of());
+        assertThat(updated.passages()).isNotEmpty().allMatch(passage -> amended.contains(passage.quote()));
+
+        jdbc.sql("DELETE FROM documents WHERE id = :id").param("id", documentId).update();
+        awaitLiveIndex(workspace.id());
+        assertThat(indexedVersions(documentId)).containsExactly(3L, 3L);
+        rejectVersion(workspace.id(), documentId, 2);
+        assertThat(jdbc.sql("SELECT count(*) FROM hybrid_document_index_chunks WHERE document_id = :id")
+                .param("id", documentId).query(Long.class).single()).isZero();
+        assertThat(index.rank(workspace.id(), "질의응답 품질 검토", List.of(documentId), "question", 0, null, List.of())
+                .documentIds()).isEmpty();
+    }
+
+    private List<Long> indexedVersions(long documentId) {
+        return jdbc.sql("SELECT source_version, indexed_version FROM hybrid_document_index_jobs WHERE document_id = :id")
+                .param("id", documentId).query((row, index) -> List.of(row.getLong(1), row.getLong(2))).single();
+    }
+
+    private void rejectVersion(long workspaceId, long documentId, long version) throws Exception {
+        var oldJob = livePython("-c", """
+                import os
+                import sys
+                from live_index import IndexWork, LiveIndex
+                workspace, document, version = map(int, sys.argv[1:])
+                index = LiveIndex(os.environ["KNOT_HYBRID_LIVE_DSN"], (workspace,))
+                assert not index.apply(IndexWork(workspace, document, version, None), ())
+                """, Long.toString(workspaceId), Long.toString(documentId), Long.toString(version))
+                .inheritIO().start();
+        assertThat(oldJob.waitFor(20, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        assertThat(oldJob.exitValue()).isZero();
     }
 
     private List<Observation> replay(
