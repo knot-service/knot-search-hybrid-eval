@@ -11,6 +11,7 @@ import static org.mockito.Mockito.verify;
 import com.knot.backend.auth.domain.AuthTokenProvider;
 import com.knot.backend.auth.domain.model.AuthenticatedMember;
 import com.knot.backend.document.DocumentFixtures;
+import com.knot.backend.global.config.SearchWorkerProperties;
 import com.knot.backend.search.application.SearchHybridQuestion.Route;
 import com.knot.backend.search.application.dto.command.SearchQuestionCommand;
 import com.knot.backend.search.application.dto.result.SearchAnswerWorkResult;
@@ -40,6 +41,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledIfEnvironmentVariable;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -63,6 +65,8 @@ import tools.jackson.databind.ObjectMapper;
 @TestApplicationProperties
 @EnabledIfEnvironmentVariable(named = "KNOT_PHASE5_FIXTURES", matches = ".+")
 class SearchHybridDatasetReplayTest {
+    @Autowired
+    private SearchWorkerProperties workerProperties;
     @Autowired
     private JdbcClient jdbc;
     @Autowired
@@ -93,6 +97,7 @@ class SearchHybridDatasetReplayTest {
     }
 
     @Test
+    @DisabledIfEnvironmentVariable(named = "KNOT_PHASE6_LOAD", matches = "true")
     void replaysEvidenceAndVerifiesRealWorkerSse() throws Exception {
         Dataset dataset = mapper.readValue(
                 Path.of(System.getenv("KNOT_PHASE5_FIXTURES"))
@@ -223,6 +228,309 @@ class SearchHybridDatasetReplayTest {
                         .containsAll(row.expectedIds());
             }
         }
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "KNOT_PHASE6_LOAD", matches = "true")
+    void measuresMixedConcurrentSse() throws Exception {
+        var fixture = Path.of(System.getenv("KNOT_PHASE5_FIXTURES"));
+        Dataset dataset = mapper.readValue(
+                fixture.toFile(),
+                Dataset.class
+        );
+        DocumentFixtures fixtures = new DocumentFixtures(jdbc);
+        Map<Long, Long> members = new LinkedHashMap<>();
+        for (Workspace workspace : dataset.workspaces()) {
+            members.put(
+                    workspace.id(),
+                    seed(
+                            fixtures,
+                            workspace
+                    )
+            );
+        }
+        Map<Long, SearchHybridWorkflow.Result> observed = new ConcurrentHashMap<>();
+        doAnswer(call -> {
+            SearchToolScope scope = call.getArgument(0);
+            SearchHybridWorkflow.Result result = (SearchHybridWorkflow.Result) call.callRealMethod();
+            observed.put(
+                    scope.answerId(),
+                    result
+            );
+            return result;
+        }).when(hybrid)
+                .retrieve(
+                        any(),
+                        any()
+                );
+
+        int waves = Integer.parseInt(
+                System.getenv()
+                        .getOrDefault(
+                                "KNOT_PHASE6_WAVES",
+                                "12"
+                        )
+        );
+        assertThat(waves).isBetween(
+                1,
+                100
+        );
+        List<LoadSample> samples = new ArrayList<>();
+        try (HttpClient http = HttpClient.newHttpClient()) {
+            List<LoadQuestion> warmup = questions(
+                    dataset,
+                    6,
+                    0
+            );
+            var warmed = SearchHybridLoadReplay.wave(
+                    http,
+                    mapper,
+                    requests(
+                            warmup,
+                            members
+                    )
+            );
+            assertThat(warmed).allMatch(sample -> sample.completedNanos() != null);
+            clearInvocations(llm);
+            observed.clear();
+            for (int concurrency : List.of(
+                    3,
+                    6
+            )) {
+                for (int wave = 0; wave < waves; wave++) {
+                    List<LoadQuestion> questions = questions(
+                            dataset,
+                            concurrency,
+                            wave
+                    );
+                    var events = SearchHybridLoadReplay.wave(
+                            http,
+                            mapper,
+                            requests(
+                                    questions,
+                                    members
+                            )
+                    );
+                    for (int index = 0; index < events.size(); index++) {
+                        samples.add(
+                                new LoadSample(
+                                        concurrency,
+                                        wave,
+                                        questions.get(index),
+                                        events.get(index)
+                                )
+                        );
+                    }
+                }
+                System.out.printf(
+                        "phase6 concurrency=%d measured=%d%n",
+                        concurrency,
+                        concurrency * waves
+                );
+            }
+        }
+
+        Map<Long, Integer> generations = new HashMap<>();
+        Map<Long, Integer> classifications = new HashMap<>();
+        for (var invocation : mockingDetails(llm).getInvocations()) {
+            if (invocation.getArguments().length == 0
+                    || !(invocation.getArgument(0) instanceof SearchToolScope scope)) {
+                continue;
+            }
+            switch (invocation.getMethod()
+                    .getName()) {
+                case "stream", "streamStructuredAnswer" -> generations.merge(
+                        scope.answerId(),
+                        1,
+                        Integer::sum
+                );
+                case "intent" -> classifications.merge(
+                        scope.answerId(),
+                        1,
+                        Integer::sum
+                );
+                default -> {
+                }
+            }
+        }
+        List<LoadObservation> results = new ArrayList<>();
+        for (LoadSample sample : samples) {
+            var event = sample.event();
+            var question = sample.question();
+            var item = question.item();
+            var result = observed.get(event.answerId());
+            Route route = null;
+            List<Long> candidates = List.of();
+            if (result != null) {
+                route = result.route();
+                candidates = ids(result);
+            }
+            List<Long> cited = jdbc.sql("SELECT document_id FROM search_evidences WHERE message_id = :id ORDER BY rank")
+                    .param(
+                            "id",
+                            event.answerId()
+                    )
+                    .query(Long.class)
+                    .list();
+            results.add(
+                    new LoadObservation(
+                            sample.concurrency(),
+                            sample.wave(),
+                            question.workspaceId(),
+                            item.id(),
+                            item.route(),
+                            route,
+                            event.httpStatus(),
+                            event.terminal(),
+                            generations.getOrDefault(
+                                    event.answerId(),
+                                    0
+                            ),
+                            classifications.getOrDefault(
+                                    event.answerId(),
+                                    0
+                            ),
+                            item.expectedIds(),
+                            candidates,
+                            cited,
+                            event.answer(),
+                            event.firstNanos(),
+                            event.completedNanos()
+                    )
+            );
+        }
+
+        Path output = fixture.resolveSibling("phase6-spring-load-report.json");
+        Path staging = Files.createTempFile(
+                output.getParent(),
+                "phase6-",
+                ".json",
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"))
+        );
+        mapper.writerWithDefaultPrettyPrinter()
+                .writeValue(
+                        staging.toFile(),
+                        new LoadReport(
+                                6,
+                                waves,
+                                workerProperties.getConcurrency(),
+                                workerProperties.getStreamConcurrency(),
+                                workerProperties.getPollInterval()
+                                        .toMillis(),
+                                results
+                        )
+                );
+        Files.move(
+                staging,
+                output,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING
+        );
+        assertThat(results).hasSize(9 * waves);
+        assertThat(
+                results.stream()
+                        .filter(row -> row.expectedRoute() == Route.DOCUMENT_FIND)
+        ).allSatisfy(row -> {
+            assertThat(row.actualRoute()).isEqualTo(Route.DOCUMENT_FIND);
+            assertThat(row.generationCalls()).isZero();
+            assertThat(row.classificationCalls()).isZero();
+        });
+    }
+
+    private List<LoadQuestion> questions(
+            Dataset dataset,
+            int concurrency,
+            int wave
+    ) {
+        List<LoadQuestion> questions = new ArrayList<>();
+        List<Route> routes = List.of(
+                Route.DOCUMENT_FIND,
+                Route.MEETING_QUESTION,
+                Route.MULTI_MEETING_SYNTHESIS
+        );
+        for (int index = 0; index < concurrency; index++) {
+            int occurrence = wave * (concurrency / routes.size()) + index / routes.size();
+            int routeIndex = index % routes.size();
+            Workspace workspace = dataset.workspaces()
+                    .get(
+                            (occurrence + routeIndex) % dataset.workspaces()
+                                    .size()
+                    );
+            List<EvalCase> cohort = workspace.cases()
+                    .stream()
+                    .filter(item -> item.live() && item.route() == routes.get(routeIndex))
+                    .toList();
+            EvalCase selected = cohort.get(
+                    (occurrence / dataset.workspaces()
+                            .size()) % cohort.size()
+            );
+            questions.add(
+                    new LoadQuestion(
+                            workspace.id(),
+                            selected
+                    )
+            );
+        }
+        return questions;
+    }
+
+    private List<HttpRequest> requests(
+            List<LoadQuestion> questions,
+            Map<Long, Long> members
+    ) {
+        return questions.stream()
+                .map(
+                        question -> request(
+                                question.workspaceId(),
+                                members.get(question.workspaceId()),
+                                question.item()
+                                        .question()
+                        )
+                )
+                .toList();
+    }
+
+    private record LoadQuestion(
+            long workspaceId,
+            EvalCase item
+    ) {
+    }
+
+    private record LoadSample(
+            int concurrency,
+            int wave,
+            LoadQuestion question,
+            SearchHybridLoadReplay.Sample event
+    ) {
+    }
+
+    private record LoadObservation(
+            int concurrency,
+            int wave,
+            long workspaceId,
+            String caseId,
+            Route expectedRoute,
+            Route actualRoute,
+            int httpStatus,
+            String terminal,
+            int generationCalls,
+            int classificationCalls,
+            List<Long> expectedIds,
+            List<Long> candidateIds,
+            List<Long> citedIds,
+            String answer,
+            Long firstNanos,
+            Long completedNanos
+    ) {
+    }
+
+    private record LoadReport(
+            int warmupRequests,
+            int wavesPerLevel,
+            int workerConcurrency,
+            int streamConcurrency,
+            long pollIntervalMs,
+            List<LoadObservation> requests
+    ) {
     }
 
     private List<Observation> replay(
