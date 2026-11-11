@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from threading import Lock
 
-from phase4_retrieval import BASELINE, WORKER_SETTINGS, RankRequest, RetrievalSettings, app, lifespan
+from phase4_retrieval import BASELINE, SPARE_SLOT_SETTINGS, RankRequest, RetrievalSettings, app, lifespan
 from phase5_eval import FIND, SYNTHESIS
 from quality1_eval import SYNTHETIC_SPANS, span_match, synthetic_match
 from database import LOCAL, vector_literal
@@ -167,12 +167,87 @@ def accepted(candidate, baseline):
             and candidate[458]["matched"] >= baseline[458]["matched"])
 
 
+def compare_representatives(replay, root, stage):
+    audit = read(root / "overlap-reuse/supplement-overlap.json")
+    misses = audit["misses"]
+    target = {
+        (m["case"], m["document"], m["field"], m["start"], m["end"])
+        for m in misses if m["mode"] == "synthesis" and m["selectedMeetings"] == 5
+    }
+    all_misses = {(m["case"], m["document"], m["field"], m["start"], m["end"]) for m in misses}
+    settings = SPARE_SLOT_SETTINGS
+    stats, before = replay.run(settings, "dates")
+    assert (stats[1]["matched"], len(target), len(all_misses)) == (378, 62, 122), stats
+    print("control", stats, flush=True)
+    trials = []
+
+    def trial(name, config):
+        scores, after = replay.run(config, "dates")
+        result = {
+            "name": name, "settings": config.model_dump(), "stats": scores,
+            "delta": compare(before, after), "targetRecovered": len(target & after[1]),
+            "allMissesRecovered": len(all_misses & after[1]),
+            **changed_spans(before, after),
+        }
+        trials.append(result)
+        print(name, scores[1]["matched"], result["delta"], result["targetRecovered"],
+              result["allMissesRecovered"], scores[1]["meetings"], scores[458]["matched"], flush=True)
+        return scores, result
+
+    if stage != "meeting-representatives":
+        expanded = settings.model_copy(update={"context_budget": 3072, "expand_source_window": True})
+        trial("기존 대표와 범위 확장 3072", expanded)
+        settings_to_try = ((1, 0, 5), (1, 0, 12), (1, 0, 24), (1, 24, 0), (1, 48, 0), (1, 20, 12))
+        if stage == "meeting-representatives-refine":
+            settings_to_try = ((1, 6, 2), (1, 24, 1), (1, 24, 2), (1, 24, 3), (1, 24, 5))
+        for body, lexical, rrf in settings_to_try:
+            bonuses = {
+                "representative_body_bonus": body, "representative_lexical_bonus": lexical,
+                "representative_rrf_bonus": rrf,
+            }
+            label = f"본문 {body} · 검색어 {lexical} · RRF {rrf}"
+            trial(label, settings.model_copy(update=bonuses))
+            trial(f"{label} · 범위 확장 3072", expanded.model_copy(update={
+                **bonuses, "representatives_only_when_full": False,
+            }))
+        (root / f"{stage}.json").write_text(json.dumps({
+            "baseline": stats, "target": sorted(target), "trials": trials,
+        }, indent=2) + "\n")
+        return
+
+    best = settings
+    best_count = stats[1]["matched"]
+    for body, lexical in ((2.5, 0.0), (4.0, 0.0), (1.0, 3.0), (1.0, 6.0), (2.5, 6.0), (1.0, 10.0)):
+        config = settings.model_copy(update={
+            "representative_body_bonus": body, "representative_lexical_bonus": lexical,
+        })
+        scores, result = trial(f"대표 본문 {body:g} · 검색어 {lexical:g}", config)
+        if accepted(scores, stats) and scores[1]["matched"] > best_count:
+            best, best_count = config, scores[1]["matched"]
+
+    for budget in (3072, 4096):
+        trial(f"토큰만 {budget}", settings.model_copy(update={"context_budget": budget}))
+    for budget in (2048, 3072, 4096):
+        trial(f"한 문서 범위 확장 {budget}", best.model_copy(update={
+            "context_budget": budget, "expand_source_window": True,
+        }))
+        trial(f"전체 종합 대표와 범위 확장 {budget}", best.model_copy(update={
+            "context_budget": budget, "expand_source_window": True, "representatives_only_when_full": False,
+        }))
+    (root / "meeting-representatives.json").write_text(json.dumps({
+        "baseline": stats, "target": sorted(target), "trials": trials,
+    }, indent=2) + "\n")
+
+
 async def run(root, stage):
     async with lifespan(app):
         replay = Replay(root, app.state)
+        if stage.startswith("meeting-representatives"):
+            compare_representatives(replay, root, stage)
+            return
         if stage == "supplement-overlap":
             misses = []
-            control = WORKER_SETTINGS.model_copy(update={"supplement_overlap_penalty": 0.0})
+            control = SPARE_SLOT_SETTINGS.model_copy(update={"supplement_overlap_penalty": 0.0})
             stats, before = replay.run(control, "dates", selection_misses=misses)
             assert (stats[1]["matched"], len(misses)) == (376, 122), stats
             print("control", stats, flush=True)
@@ -257,6 +332,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
-    parser.add_argument("stage", choices=("selection", "remaining", "followup", "supplement-overlap"))
+    parser.add_argument("stage", choices=(
+        "selection", "remaining", "followup", "supplement-overlap",
+        "meeting-representatives", "meeting-representatives-rrf", "meeting-representatives-refine",
+    ))
     args = parser.parse_args()
     asyncio.run(run(args.root, args.stage))
