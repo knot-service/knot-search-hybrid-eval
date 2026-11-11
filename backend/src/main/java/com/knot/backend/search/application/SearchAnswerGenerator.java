@@ -12,12 +12,11 @@ public interface SearchAnswerGenerator {
             List<SearchDocumentResult> documents,
             Consumer<String> onDelta
     );
-    default List<Long> generateSynthesis(
+
+    List<Long> generateGrounded(
             SearchToolScope scope,
             String question,
             List<SearchDocumentResult> documents,
             Consumer<String> onDelta
-    ) {
-        return generate(scope, question, documents, onDelta);
-    }
+    );
 }

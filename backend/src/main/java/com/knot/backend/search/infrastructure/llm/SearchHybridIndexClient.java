@@ -30,10 +30,12 @@ public class SearchHybridIndexClient implements AutoCloseable {
         this.endpoint = endpoint;
     }
 
-    public List<Long> rank(
+    public Output rank(
             long workspaceId,
             String question,
-            List<Long> allowedDocumentIds
+            List<Long> allowedDocumentIds,
+            String contextMode,
+            int recentMeetings
     ) {
         HttpRequest request = HttpRequest.newBuilder(endpoint)
                 .timeout(Duration.ofSeconds(10))
@@ -47,7 +49,9 @@ public class SearchHybridIndexClient implements AutoCloseable {
                                         new Input(
                                                 workspaceId,
                                                 question,
-                                                allowedDocumentIds
+                                                allowedDocumentIds,
+                                                contextMode,
+                                                recentMeetings
                                         )
                                 )
                         )
@@ -64,8 +68,7 @@ public class SearchHybridIndexClient implements AutoCloseable {
             return mapper.readValue(
                     response.body(),
                     Output.class
-            )
-                    .documentIds();
+            );
         } catch (IOException failure) {
             throw new IllegalStateException(
                     "Hybrid index request failed",
@@ -89,10 +92,27 @@ public class SearchHybridIndexClient implements AutoCloseable {
     private record Input(
             long workspaceId,
             String question,
-            List<Long> allowedDocumentIds
+            List<Long> allowedDocumentIds,
+            String contextMode,
+            int recentMeetings
     ) {
     }
 
-    private record Output(List<Long> documentIds) {
+    public record Output(
+            List<Long> documentIds,
+            List<Passage> passages,
+            double rerankMs,
+            double contextMs
+    ) {
+    }
+
+    public record Passage(
+            long documentId,
+            String field,
+            int start,
+            int end,
+            String quote,
+            int tokenCount
+    ) {
     }
 }

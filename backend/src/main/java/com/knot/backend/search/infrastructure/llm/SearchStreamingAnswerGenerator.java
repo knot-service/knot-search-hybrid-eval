@@ -29,31 +29,12 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
             List<SearchDocumentResult> documents,
             Consumer<String> onDelta
     ) {
-        return generate(scope, question, documents, onDelta, false);
-    }
-
-    @Override
-    public List<Long> generateSynthesis(
-            SearchToolScope scope,
-            String question,
-            List<SearchDocumentResult> documents,
-            Consumer<String> onDelta
-    ) {
-        return generate(scope, question, documents, onDelta, true);
-    }
-
-    private List<Long> generate(
-            SearchToolScope scope,
-            String question,
-            List<SearchDocumentResult> documents,
-            Consumer<String> onDelta,
-            boolean synthesis
-    ) {
         access.validate(scope);
         List<Map<String, Object>> messages = messages(
                 scope,
                 question,
-                documents
+                documents,
+                SearchAnswerPrompt.system()
         );
         SearchAgentContext context = new SearchAgentContext(
                 properties,
@@ -67,30 +48,44 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
                     onDelta.accept(text);
                 }
         );
-        Consumer<String> onModelText = text -> {
+        llm.stream(scope, messages, text -> {
             access.validate(scope);
             answer.accept(text);
-        };
-        if (synthesis) {
-            llm.streamStructuredAnswer(scope, messages, onModelText);
-        } else {
-            llm.stream(scope, messages, onModelText);
-        }
+        });
         access.validate(scope);
         return answer.complete(documents);
+    }
+
+    @Override
+    public List<Long> generateGrounded(
+            SearchToolScope scope,
+            String question,
+            List<SearchDocumentResult> documents,
+            Consumer<String> onDelta
+    ) {
+        access.validate(scope);
+        var messages = messages(scope, question, documents, SearchAnswerPrompt.grounded());
+        new SearchAgentContext(properties, mapper).validate(messages);
+        StringBuilder response = new StringBuilder();
+        llm.streamStructuredAnswer(scope, messages, response::append);
+        access.validate(scope);
+        SearchGroundedAnswer.Verified verified = SearchGroundedAnswer.verify(response.toString(), documents, mapper);
+        onDelta.accept(verified.render());
+        return verified.documentIds();
     }
 
     private List<Map<String, Object>> messages(
             SearchToolScope scope,
             String question,
-            List<SearchDocumentResult> documents
+            List<SearchDocumentResult> documents,
+            String systemPrompt
     ) {
         return List.of(
                 Map.of(
                         "role",
                         "system",
                         "content",
-                        SearchAnswerPrompt.system()
+                        systemPrompt
                 ),
                 Map.of(
                         "role",

@@ -4,8 +4,11 @@ import com.knot.backend.search.application.SearchHybridQuestion.Route;
 import com.knot.backend.search.application.dto.result.SearchDocumentRecord;
 import com.knot.backend.search.application.dto.result.SearchDocumentResult;
 import com.knot.backend.search.infrastructure.llm.SearchHybridIndexClient;
+import com.knot.backend.search.infrastructure.llm.SearchHybridIndexClient.Passage;
 import com.knot.backend.search.infrastructure.persistence.SearchHybridDocumentScope;
 import com.knot.backend.search.infrastructure.persistence.SearchHybridDocumentScope.EligibleDocument;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -13,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
@@ -21,6 +25,9 @@ import org.springframework.stereotype.Component;
 @ConditionalOnProperty(name = "knot.search.hybrid.index-url")
 public class SearchHybridWorkflow {
     private static final int LIMIT = 10;
+    private static final int CONTEXT_TOKENS = 1024;
+    private static final DateTimeFormatter MEETING_TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss XXX")
+            .withZone(ZoneId.of("Asia/Seoul"));
 
     private final SearchHybridIndexClient index;
     private final SearchHybridDocumentScope documentScope;
@@ -66,8 +73,11 @@ public class SearchHybridWorkflow {
             return new Result(
                     question.route(),
                     List.of(),
+                    List.of(),
                     questionNanos,
-                    System.nanoTime() - retrievalStarted
+                    0,
+                    0,
+                    0
             );
         }
 
@@ -78,104 +88,222 @@ public class SearchHybridWorkflow {
                         doc
                 )
         );
-        List<EligibleDocument> ranked = index.rank(
+        var ranking = index.rank(
                 scope.workspaceId(),
                 rawQuestion,
-                List.copyOf(allowed.keySet())
-        )
-                .stream()
+                List.copyOf(allowed.keySet()),
+                contextMode(question.route()),
+                question.recentMeetings()
+        );
+        access.validate(scope);
+        List<Passage> verified = new ArrayList<>();
+        List<SearchDocumentResult> selected;
+        if (question.route() == Route.DOCUMENT_FIND) {
+            selected = lookup(
+                    scope,
+                    question,
+                    ranking.documentIds(),
+                    allowed
+            );
+        } else {
+            selected = context(
+                    scope,
+                    question,
+                    ranking.passages(),
+                    allowed,
+                    verified
+            );
+        }
+        access.validate(scope);
+        return new Result(
+                question.route(),
+                selected,
+                List.copyOf(verified),
+                questionNanos,
+                System.nanoTime() - retrievalStarted,
+                ranking.rerankMs(),
+                ranking.contextMs()
+        );
+    }
+
+    private String contextMode(Route route) {
+        return switch (route) {
+            case DOCUMENT_FIND -> "none";
+            case MEETING_QUESTION -> "question";
+            case MULTI_MEETING_SYNTHESIS -> "synthesis";
+        };
+    }
+
+    private List<SearchDocumentResult> lookup(
+            SearchToolScope scope,
+            SearchHybridQuestion question,
+            List<Long> ids,
+            Map<Long, EligibleDocument> allowed
+    ) {
+        var ranked = ids.stream()
                 .filter(allowed::containsKey)
                 .distinct()
-                .map(allowed::get)
-                .toList();
-        access.validate(scope);
-        List<SearchDocumentResult> selected = select(
-                question,
-                ranked
-        ).stream()
+                .map(allowed::get);
+        if (question.recentMeetings() > 0) {
+            Map<Long, EligibleDocument> byMeeting = new LinkedHashMap<>();
+            ranked.forEach(
+                    doc -> byMeeting.putIfAbsent(
+                            doc.meetingId(),
+                            doc
+                    )
+            );
+            ranked = byMeeting.values()
+                    .stream()
+                    .sorted(
+                            Comparator.comparing(EligibleDocument::recordedAt)
+                                    .reversed()
+                    )
+                    .limit(question.recentMeetings());
+        }
+        return ranked.limit(LIMIT)
                 .map(
                         candidate -> documents.find(
                                 scope,
                                 candidate.id()
                         )
-                                .map(
-                                        record -> document(
-                                                question,
-                                                candidate,
-                                                record
-                                        )
-                                )
                 )
                 .flatMap(Optional::stream)
+                .map(
+                        doc -> new SearchDocumentResult(
+                                doc.documentId(),
+                                doc.title(),
+                                doc.topic(),
+                                ""
+                        )
+                )
                 .toList();
-        access.validate(scope);
-        return new Result(
-                question.route(),
-                selected,
-                questionNanos,
-                System.nanoTime() - retrievalStarted
-        );
     }
 
-    private List<EligibleDocument> select(
+    private List<SearchDocumentResult> context(
+            SearchToolScope scope,
             SearchHybridQuestion question,
-            List<EligibleDocument> ranked
+            List<Passage> passages,
+            Map<Long, EligibleDocument> allowed,
+            List<Passage> verified
     ) {
-        if (question.route() != Route.MULTI_MEETING_SYNTHESIS && question.recentMeetings() == 0) {
-            return ranked.stream()
-                    .limit(LIMIT)
-                    .toList();
+        if (passages == null || passages.size() > 5 || passages.stream()
+                .anyMatch(p -> p.tokenCount() < 1)
+                || passages.stream()
+                        .mapToLong(Passage::tokenCount)
+                        .sum() > CONTEXT_TOKENS) {
+            throw new IllegalStateException("Invalid hybrid context budget");
         }
-        Map<Long, EligibleDocument> byMeeting = new LinkedHashMap<>();
-        ranked.forEach(
-                doc -> byMeeting.putIfAbsent(
-                        doc.meetingId(),
-                        doc
+        Map<Long, List<Passage>> byDocument = passages.stream()
+                .filter(p -> allowed.containsKey(p.documentId()))
+                .collect(
+                        Collectors.groupingBy(
+                                Passage::documentId,
+                                LinkedHashMap::new,
+                                Collectors.toList()
+                        )
+                );
+        var entries = byDocument.entrySet()
+                .stream();
+        if (question.route() == Route.MULTI_MEETING_SYNTHESIS) {
+            entries = entries.sorted(
+                    Comparator.comparing(
+                            entry -> allowed.get(entry.getKey())
+                                    .recordedAt()
+                    )
+            );
+        }
+        return entries.map(
+                entry -> documents.find(
+                        scope,
+                        entry.getKey()
+                )
+                        .flatMap(
+                                doc -> excerpt(
+                                        doc,
+                                        entry.getValue(),
+                                        verified
+                                )
+                        )
+        )
+                .flatMap(Optional::stream)
+                .toList();
+    }
+
+    private Optional<SearchDocumentResult> excerpt(
+            SearchDocumentRecord doc,
+            List<Passage> passages,
+            List<Passage> verified
+    ) {
+        List<Passage> valid = passages.stream()
+                .filter(
+                        passage -> exactPassage(
+                                doc,
+                                passage
+                        )
+                )
+                .toList();
+        if (valid.isEmpty()) {
+            return Optional.empty();
+        }
+        verified.addAll(valid);
+        List<String> quotes = valid.stream()
+                .map(Passage::quote)
+                .toList();
+        String text = "회의 시각(한국): " + MEETING_TIME.format(doc.recordingStartedAt()) + "\n" + String.join(
+                "\n\n",
+                quotes
+        );
+        return Optional.of(
+                new SearchDocumentResult(
+                        doc.documentId(),
+                        doc.title(),
+                        doc.topic(),
+                        text,
+                        quotes
                 )
         );
-        List<EligibleDocument> meetings = new ArrayList<>(byMeeting.values());
-        if (question.recentMeetings() > 0) {
-            meetings.sort(
-                    Comparator.comparing(EligibleDocument::recordedAt)
-                            .reversed()
-            );
-            meetings = meetings.stream()
-                    .limit(question.recentMeetings())
-                    .toList();
-        }
-        List<EligibleDocument> chosen = meetings.stream()
-                .limit(LIMIT)
-                .toList();
-        if (question.route() == Route.MULTI_MEETING_SYNTHESIS) {
-            return chosen.stream()
-                    .sorted(Comparator.comparing(EligibleDocument::recordedAt))
-                    .toList();
-        }
-        return chosen;
     }
 
-    private SearchDocumentResult document(
-            SearchHybridQuestion question,
-            EligibleDocument candidate,
-            SearchDocumentRecord record
+    static boolean exactPassage(
+            SearchDocumentRecord doc,
+            Passage passage
     ) {
-        String content = record.content();
-        if (question.route() == Route.MULTI_MEETING_SYNTHESIS) {
-            content = "회의 시각: " + candidate.recordedAt() + "\n" + content;
+        String source = switch (passage.field()) {
+            case "body" -> doc.content();
+            case "summary" -> doc.summary();
+            case null, default -> null;
+        };
+        if (doc.documentId() != passage.documentId() || source == null || passage.quote() == null || passage.quote()
+                .isBlank() || passage.start() < 0 || passage.end() <= passage.start()
+                || passage.end() > source.codePointCount(
+                        0,
+                        source.length()
+                )) {
+            return false;
         }
-        return new SearchDocumentResult(
-                record.documentId(),
-                record.title(),
-                record.topic(),
-                content
+        int start = source.offsetByCodePoints(
+                0,
+                passage.start()
         );
+        int end = source.offsetByCodePoints(
+                0,
+                passage.end()
+        );
+        return source.substring(
+                start,
+                end
+        )
+                .equals(passage.quote());
     }
 
     public record Result(
             Route route,
             List<SearchDocumentResult> documents,
+            List<Passage> passages,
             long questionNanos,
-            long retrievalNanos
+            long retrievalNanos,
+            double rerankMs,
+            double contextMs
     ) {
     }
 }

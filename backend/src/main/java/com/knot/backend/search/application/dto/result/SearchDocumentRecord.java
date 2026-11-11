@@ -8,6 +8,7 @@ public record SearchDocumentRecord(
         String title,
         String topic,
         String content,
+        String summary,
         DocumentStatus status,
         Instant recordingStartedAt,
         Instant createdAt,

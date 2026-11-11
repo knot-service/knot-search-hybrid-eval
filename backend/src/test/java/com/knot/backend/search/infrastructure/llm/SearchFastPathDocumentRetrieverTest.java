@@ -121,6 +121,7 @@ class SearchFastPathDocumentRetrieverTest {
                 title,
                 "운영",
                 "문서 본문",
+                "",
                 DocumentStatus.ARCHIVED,
                 Instant.parse("2026-10-17T00:00:00Z"),
                 Instant.parse("2026-10-17T00:01:00Z"),

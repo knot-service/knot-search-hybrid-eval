@@ -237,7 +237,7 @@ public class SearchLlmClient {
             Consumer<String> onDelta
     ) {
         Map<String, Object> request = body(messages, true);
-        request.put("response_format", SearchAnswerResponse.responseFormat());
+        request.put("response_format", SearchGroundedAnswer.responseFormat());
         stream(scope, messages, request, onDelta);
     }
 

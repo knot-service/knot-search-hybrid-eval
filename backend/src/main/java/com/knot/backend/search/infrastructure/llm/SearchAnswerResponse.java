@@ -43,23 +43,6 @@ public record SearchAnswerResponse(
             "NOT_APPLICABLE"
     );
 
-    static Map<String, Object> responseFormat() {
-        Map<String, Object> schema = Map.of(
-                "type", "object",
-                "properties", Map.of(
-                        "status", Map.of("type", "string", "enum", STATUSES.stream().sorted().toList()),
-                        "decisionState", Map.of("type", "string", "enum", DECISIONS.stream().sorted().toList()),
-                        "answer", Map.of("type", "string"),
-                        "evidenceIds", Map.of("type", "array", "items", Map.of("type", "string"), "maxItems", 3),
-                        "clarificationQuestion", Map.of("type", List.of("string", "null"))
-                ),
-                "required", FIELDS.stream().sorted().toList(),
-                "additionalProperties", false
-        );
-        return Map.of("type", "json_schema", "json_schema",
-                Map.of("name", "knot_search_answer", "strict", true, "schema", schema));
-    }
-
     public static SearchAnswerResponse parse(
             String json,
             List<SearchDocumentResult> documents,

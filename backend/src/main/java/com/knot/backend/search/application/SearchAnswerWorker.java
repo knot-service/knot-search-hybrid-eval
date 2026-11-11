@@ -106,12 +106,12 @@ public class SearchAnswerWorker {
         if (hybrid != null && hybrid.enabledFor(scope.workspaceId())) {
             SearchHybridWorkflow.Result result = hybrid.retrieve(scope, work.question());
             log.info(
-                    "Hybrid search workspaceId={} answerId={} route={} questionMs={} retrievalMs={} candidates={}",
+                    "Hybrid search workspaceId={} answerId={} route={} questionMs={} retrievalMs={} rerankMs={} contextMs={} candidates={}",
                     work.workspaceId(), work.answerId(), result.route(), result.questionNanos() / 1_000_000,
-                    result.retrievalNanos() / 1_000_000, result.documents().size()
+                    result.retrievalNanos() / 1_000_000, result.rerankMs(), result.contextMs(), result.documents().size()
             );
             deliver(work, scope, new SearchRetrievalResult(result.documents(), 0),
-                    result.route(), persistenceCount, persistenceNanos);
+                    result.route(), true, persistenceCount, persistenceNanos);
             return;
         }
         long classificationStarted = System.nanoTime();
@@ -181,7 +181,7 @@ public class SearchAnswerWorker {
             );
             throw exception;
         }
-        deliver(work, scope, retrieval, Route.MEETING_QUESTION, persistenceCount, persistenceNanos);
+        deliver(work, scope, retrieval, Route.MEETING_QUESTION, false, persistenceCount, persistenceNanos);
     }
 
     private void deliver(
@@ -189,6 +189,7 @@ public class SearchAnswerWorker {
             SearchToolScope scope,
             SearchRetrievalResult retrieval,
             Route route,
+            boolean grounded,
             AtomicLong persistenceCount,
             AtomicLong persistenceNanos
     ) {
@@ -238,7 +239,7 @@ public class SearchAnswerWorker {
         )) {
             long generationStarted = System.nanoTime();
             try {
-                usedIds = generateAnswer(generator, route, scope, work.question(), documents, content);
+                usedIds = generateAnswer(generator, grounded, scope, work.question(), documents, content);
                 log.info(
                         "Search latency phase=answer_generation workspaceId={} answerId={} elapsedMs={} inputChars={} documentCount={} outcome=success",
                         work.workspaceId(),
@@ -274,14 +275,14 @@ public class SearchAnswerWorker {
 
     private List<Long> generateAnswer(
             SearchAnswerGenerator generator,
-            Route route,
+            boolean grounded,
             SearchToolScope scope,
             String question,
             List<SearchDocumentResult> documents,
             SearchAnswerContentBuffer content
     ) {
-        if (route == Route.MULTI_MEETING_SYNTHESIS) {
-            return generator.generateSynthesis(scope, question, documents, content);
+        if (grounded) {
+            return generator.generateGrounded(scope, question, documents, content);
         }
         return generator.generate(scope, question, documents, content);
     }

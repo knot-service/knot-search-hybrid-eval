@@ -19,7 +19,7 @@ import org.springframework.stereotype.Repository;
 @RequiredArgsConstructor
 public class SearchDocumentQueryAdapter implements SearchDocumentQuery {
     private static final String SELECT = """
-            SELECT d.id, d.title, d.topic, d.content, d.status, d.created_at, d.archived_at, r.started_at, 0 AS score
+            SELECT d.id, d.title, d.topic, d.content, d.summary, d.status, d.created_at, d.archived_at, r.started_at, 0 AS score
             FROM documents d JOIN recording_sessions r ON r.id = d.recording_session_id
             WHERE d.workspace_id = :workspace AND r.workspace_id = :workspace
               AND d.status IN ('DRAFT', 'ARCHIVED') AND d.created_at <= :cutoff
@@ -35,7 +35,7 @@ public class SearchDocumentQueryAdapter implements SearchDocumentQuery {
             long documentId
     ) {
         String sql = """
-                SELECT d.id, d.title, d.topic, d.content, d.status, d.created_at, d.archived_at, r.started_at, 0 AS score
+                SELECT d.id, d.title, d.topic, d.content, d.summary, d.status, d.created_at, d.archived_at, r.started_at, 0 AS score
                 FROM documents d JOIN recording_sessions r ON r.id = d.recording_session_id
                 WHERE d.id = :id AND d.workspace_id = :workspace AND r.workspace_id = :workspace
                   AND d.status IN ('DRAFT', 'ARCHIVED') AND d.created_at <= :cutoff
@@ -215,6 +215,7 @@ public class SearchDocumentQueryAdapter implements SearchDocumentQuery {
                 row.getString("title"),
                 row.getString("topic"),
                 row.getString("content"),
+                row.getString("summary"),
                 DocumentStatus.valueOf(row.getString("status")),
                 row.getTimestamp("started_at")
                         .toInstant(),
