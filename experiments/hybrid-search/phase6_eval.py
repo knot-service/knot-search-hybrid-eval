@@ -1,10 +1,10 @@
 """Summarize the mixed Spring SSE replay without publishing questions or source text."""
+from argparse import ArgumentParser
 from collections import Counter
 from math import ceil
 import json
 from pathlib import Path
 import re
-import sys
 
 from database import LOCAL
 from phase5_eval import FIND, QUESTION, SYNTHESIS, emitted_claims, read, write
@@ -68,13 +68,21 @@ def worker_timings(path: Path, summary: dict) -> None:
             route["workerRetrievalP95Ms"] = sorted(retrieval[answer][1] for answer in matching)[rank]
 
 
-def summarize(log_path: Path | None = None) -> None:
+def sample_key(row: dict) -> tuple[int, int, int, str]:
+    return row["concurrency"], row["wave"], row["workspaceId"], row["caseId"]
+
+
+def summarize(log_path: Path | None = None, run_dir: Path = Path(".")) -> None:
     fixture = read("phase5-fixtures.json")
     baseline = read("phase5-spring-report.json")
     baseline_replay = {row["caseId"]: row for row in baseline["replay"]}
     baseline_sse = {row["caseId"]: row for row in baseline["sse"]}
-    load = read("phase6-spring-load-report.json")
+    load = read(str(run_dir / "phase6-spring-load-report.json"))
     rows = load["requests"]
+    shared = {}
+    if run_dir != Path("."):
+        shared = {sample_key(row): row for row in read("phase6-spring-load-report.json")["requests"]}
+        assert len(shared) == len(rows) and shared.keys() == {sample_key(row) for row in rows}
     levels = sorted({row["concurrency"] for row in rows})
     top = max(levels)
     quality = []
@@ -94,6 +102,8 @@ def summarize(log_path: Path | None = None) -> None:
         peak: dict[str, dict] = {}
         context_regressions = 0
         context_improvements = 0
+        shared_comparisons = 0
+        shared_regressions = 0
         for row in comparable:
             previous = baseline_replay[row["caseId"]]
             assert previous["workspaceId"] == workspace_id and previous["expectedIds"] == row["expectedIds"]
@@ -101,6 +111,11 @@ def summarize(log_path: Path | None = None) -> None:
             after = hit_meetings(row, meetings, "candidateIds")
             context_regressions += bool(before - after)
             context_improvements += bool(after - before)
+            previous_shared = shared.get(sample_key(row))
+            if previous_shared is not None and previous_shared["actualRoute"] is not None:
+                assert previous_shared["expectedIds"] == row["expectedIds"]
+                shared_comparisons += 1
+                shared_regressions += bool(hit_meetings(previous_shared, meetings, "candidateIds") - after)
 
         claims_count = 0
         uncited_claims = 0
@@ -132,6 +147,8 @@ def summarize(log_path: Path | None = None) -> None:
             "contextComparisons": len(comparable),
             "contextRegressions": context_regressions,
             "contextImprovements": context_improvements,
+            "sharedComparisons": shared_comparisons,
+            "sharedRegressions": shared_regressions,
             "completedAnswers": len(answered),
             "noClaimAnswers": no_claim_answers,
             "claims": claims_count,
@@ -158,9 +175,9 @@ def summarize(log_path: Path | None = None) -> None:
             for route in ROUTES
         ]} for level in levels],
     )
-    review_file = LOCAL / "phase6-semantic-review.json"
-    if review_file.is_file():
-        review = read(review_file.name)
+    review_file = run_dir / "phase6-semantic-review.json"
+    if (LOCAL / review_file).is_file():
+        review = read(str(review_file))
         verdicts = {(row["workspaceId"], row["caseId"], row["claimIndex"]): row["verdict"] for row in review["claims"]}
         expected = {(row["workspaceId"], row["caseId"], index)
                     for row in audit for index, _ in enumerate(row["claims"], 1)}
@@ -173,10 +190,14 @@ def summarize(log_path: Path | None = None) -> None:
 
     if log_path is not None:
         worker_timings(log_path, summary)
-    write("phase6-citation-audit.json", {"cases": audit})
-    write("phase6-summary.json", summary)
+    write(str(run_dir / "phase6-citation-audit.json"), {"cases": audit})
+    write(str(run_dir / "phase6-summary.json"), summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
-    summarize(Path(sys.argv[1]) if len(sys.argv) > 1 else None)
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("worker_log", nargs="?", type=Path)
+    parser.add_argument("--run-dir", default=Path("."), type=Path, help="Run subdirectory under .local")
+    args = parser.parse_args()
+    summarize(args.worker_log, args.run_dir)

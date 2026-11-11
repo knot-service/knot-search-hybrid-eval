@@ -257,3 +257,39 @@ cd ../experiments/hybrid-search
 ```
 
 `KNOT_PHASE6_WAVES`로 동시성별 반복 수를 바꿀 수 있다. Worker 로그를 생략하면 HTTP와 SSE 지표만 집계한다. 요청별 답변과 사례 원문은 권한 600인 `.local/` 보고서에 기록하고 Lab에는 집계만 게시한다.
+
+### 6차 후속: 문서 찾기 Worker 분리 전후
+
+하이브리드 문서 찾기를 접수·재시도할 때 실행 행에 경로를 저장한다. 검색 스케줄러는 그 경로를 기준으로 두 대기열을 각각 조회한다. 문서 찾기 Worker는 문서 목록만 반환하며, 검색 설정이 중간에 바뀌어 이 경로를 실행할 수 없으면 생성 경로로 보내지 않고 실패 처리한다. `SEARCH_LOOKUP_WORKER_CONCURRENCY` 기본값은 0이라 기존 공유 Worker를 사용한다. 이미 큐에 있던 행은 공유 경로에 남고, 실패한 요청을 재시도하면 현재 설정으로 다시 분류한다.
+
+같은 데이터 스냅샷, 질문·회차 구성, Qwen 설정과 SSE 측정 기준으로 두 번 실행했다. 분리 전에는 공용 Worker 2개, 분리 후에는 생성 Worker 2개와 문서 찾기 Worker 1개를 썼다. SSE 슬롯 8개와 100ms 폴링은 동일하다.
+
+| 동시 요청 | 경로 | 첫 SSE p95 / p99 (초), 전 → 후 | 전체 완료 p95 / p99 (초), 전 → 후 |
+| ---: | --- | ---: | ---: |
+| 3 | 문서 찾기 | 3.731 / 3.731 → 0.274 / 0.274 | 3.731 / 3.731 → 0.380 / 0.380 |
+| 3 | 회의 내용 질문 | 4.951 / 4.951 → 5.421 / 5.421 | 4.951 / 4.951 → 5.421 / 5.421 |
+| 3 | 여러 회의 종합 | 6.516 / 6.516 → 5.971 / 5.971 | 6.517 / 6.517 → 5.972 / 5.972 |
+| 6 | 문서 찾기 | 6.888 / 7.254 → 0.443 / 0.457 | 6.993 / 7.254 → 0.458 / 0.552 |
+| 6 | 회의 내용 질문 | 7.405 / 8.478 → 9.125 / 9.869 | 7.405 / 8.478 → 9.126 / 9.869 |
+| 6 | 여러 회의 종합 | 9.235 / 9.575 → 8.546 / 8.798 | 9.235 / 9.686 → 8.546 / 8.798 |
+
+분리 후 108/108건이 모두 완료됐다. 문서 찾기 36건은 생성·분류 호출 0회였고, 생성 경로 72건은 각각 Qwen을 1회 호출했다. 문서 찾기 Worker 대기 p95는 동시 3건에서 3.607 → 0.079초, 동시 6건에서 6.797 → 0.290초였다. 내용 질문은 느려졌고 종합은 빨라졌다. 별도 실행의 관측값이므로 이 차이를 경로 분리의 인과 효과로 해석할 수 없다. 경로당 12·24건에서 p99는 관측 최댓값이다.
+
+두 워크스페이스에서 동시성·회차·평가 사례가 같은 생성 요청 72건을 대조했다. 검색 문맥의 기대 회의가 줄어든 요청은 0/72건이었다. 원문 및 저장 출처와 일치한 인용은 214/214 → 218/218개였다. 동일 질문 10개의 첫 피크 부하 답변을 별도 의미 검수했을 때 주장 전체를 지지한 인용은 21/24 → 20/23개였다. 분리 후 부분 지지 3건은 비교와 다른 항목의 우선순위를 인용하거나 고려 사항을 확정 결정으로 표현했다. 이 표본에서 기대 회의를 모두 인용한 종합은 Workspace 1에서 2/3 → 3/3건, Workspace 458에서 3/3 → 3/3건이었다.
+
+5차 검색 서비스와 환경을 준비한 뒤 저장소 루트에서 별도 실행 디렉터리를 사용한다.
+
+```sh
+run_dir="$PWD/experiments/hybrid-search/.local/phase6-lookup-worker"
+mkdir -p -m 700 "$run_dir"
+cp -p "$PWD/experiments/hybrid-search/.local/phase5-fixtures.json" "$run_dir/phase5-fixtures.json"
+cd backend
+KNOT_PHASE5_FIXTURES="$run_dir/phase5-fixtures.json" \
+  KNOT_PHASE6_LOAD=true SEARCH_LOOKUP_WORKER_CONCURRENCY=1 \
+  ./gradlew integrationTest --tests '*SearchHybridDatasetReplayTest.measuresMixedConcurrentSse'
+cd ../experiments/hybrid-search
+.venv/bin/python phase6_eval.py --run-dir phase6-lookup-worker \
+  ../../backend/build/test-results/integrationTest/TEST-com.knot.backend.search.application.SearchHybridDatasetReplayTest.xml
+```
+
+분리 전의 `.local/phase6-spring-load-report.json`을 보존해야 같은 사례끼리 검색 문맥을 비교할 수 있다. 답변 원문은 로컬 보고서에만 보관하고 Lab에는 집계만 게시한다.

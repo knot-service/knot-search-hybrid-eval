@@ -372,6 +372,8 @@ class SearchHybridDatasetReplayTest {
                     )
                     .query(Long.class)
                     .list();
+            boolean lookupOnly = jdbc.sql("SELECT lookup_only FROM search_answer_executions WHERE answer_id = :id")
+                    .param("id", event.answerId()).query(Boolean.class).optional().orElse(false);
             results.add(
                     new LoadObservation(
                             sample.concurrency(),
@@ -382,6 +384,7 @@ class SearchHybridDatasetReplayTest {
                             route,
                             event.httpStatus(),
                             event.terminal(),
+                            lookupOnly,
                             generations.getOrDefault(
                                     event.answerId(),
                                     0
@@ -414,6 +417,7 @@ class SearchHybridDatasetReplayTest {
                                 6,
                                 waves,
                                 workerProperties.getConcurrency(),
+                                workerProperties.getLookupConcurrency(),
                                 workerProperties.getStreamConcurrency(),
                                 workerProperties.getPollInterval()
                                         .toMillis(),
@@ -426,6 +430,8 @@ class SearchHybridDatasetReplayTest {
                 java.nio.file.StandardCopyOption.REPLACE_EXISTING
         );
         assertThat(results).hasSize(9 * waves);
+        assertThat(results).allSatisfy(row -> assertThat(row.lookupOnly())
+                .isEqualTo(workerProperties.getLookupConcurrency() > 0 && row.expectedRoute() == Route.DOCUMENT_FIND));
         assertThat(
                 results.stream()
                         .filter(row -> row.expectedRoute() == Route.DOCUMENT_FIND)
@@ -512,6 +518,7 @@ class SearchHybridDatasetReplayTest {
             Route actualRoute,
             int httpStatus,
             String terminal,
+            boolean lookupOnly,
             int generationCalls,
             int classificationCalls,
             List<Long> expectedIds,
@@ -527,6 +534,7 @@ class SearchHybridDatasetReplayTest {
             int warmupRequests,
             int wavesPerLevel,
             int workerConcurrency,
+            int lookupConcurrency,
             int streamConcurrency,
             long pollIntervalMs,
             List<LoadObservation> requests
