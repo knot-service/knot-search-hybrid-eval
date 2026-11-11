@@ -7,10 +7,21 @@ public record SearchDocumentResult(
         String title,
         String topic,
         String content,
-        List<String> excerpts
+        List<String> excerpts,
+        Long meetingId
 ) {
     public SearchDocumentResult {
         excerpts = List.copyOf(excerpts);
+    }
+
+    public SearchDocumentResult(
+            long documentId,
+            String title,
+            String topic,
+            String content,
+            List<String> excerpts
+    ) {
+        this(documentId, title, topic, content, excerpts, null);
     }
 
     public SearchDocumentResult(

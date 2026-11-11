@@ -7,14 +7,24 @@ import com.knot.backend.search.application.SearchAnswerGenerator;
 import com.knot.backend.search.application.SearchToolAccess;
 import com.knot.backend.search.application.SearchToolScope;
 import com.knot.backend.search.application.dto.result.SearchDocumentResult;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 import lombok.RequiredArgsConstructor;
 import tools.jackson.databind.ObjectMapper;
 
 @RequiredArgsConstructor
 public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
+
+    private static final String MEETING_GROUPS = """
+            evidence는 회의 ID로 묶여 있다. 같은 날이나 비슷한 시각이라도 회의 ID가 다르면 독립된 기록이다.
+            각 주장에는 그 사실을 기록한 그룹 안에서만 문서와 인용구를 고른다.
+            여러 회의를 비교하면 회의별 주장으로 나누고, 각 회의의 결정·검토·미정 상태를 구분한다.
+            질문이 지정한 회의가 확인되지 않으면 다른 그룹으로 대체하지 말고 insufficient로 표시한다.
+            sources에는 그룹 ID 대신 해당 문서의 evidenceId를 쓴다.
+            """;
 
     private final SearchLlmClient llm;
     private final SearchHistoryQuery history;
@@ -33,8 +43,8 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
         List<Map<String, Object>> messages = messages(
                 scope,
                 question,
-                documents,
-                SearchAnswerPrompt.system()
+                SearchAnswerPrompt.system(),
+                evidence(documents)
         );
         SearchAgentContext context = new SearchAgentContext(
                 properties,
@@ -64,7 +74,13 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
             Consumer<String> onDelta
     ) {
         access.validate(scope);
-        var messages = messages(scope, question, documents, SearchAnswerPrompt.grounded());
+        boolean grouped = !documents.isEmpty() && documents.stream().allMatch(doc -> doc.meetingId() != null);
+        var messages = messages(
+                scope,
+                question,
+                SearchAnswerPrompt.grounded() + (grouped ? "\n" + MEETING_GROUPS : ""),
+                grouped ? meetingEvidence(documents) : evidence(documents)
+        );
         new SearchAgentContext(properties, mapper).validate(messages);
         StringBuilder response = new StringBuilder();
         llm.streamStructuredAnswer(scope, messages, response::append);
@@ -77,8 +93,8 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
     private List<Map<String, Object>> messages(
             SearchToolScope scope,
             String question,
-            List<SearchDocumentResult> documents,
-            String systemPrompt
+            String systemPrompt,
+            List<Map<String, Object>> evidence
     ) {
         return List.of(
                 Map.of(
@@ -98,11 +114,23 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
                                         "conversationHistory",
                                         history.beforeQuestion(scope),
                                         "evidence",
-                                        evidence(documents)
+                                        evidence
                                 )
                         )
                 )
         );
+    }
+
+    private List<Map<String, Object>> meetingEvidence(List<SearchDocumentResult> documents) {
+        return documents.stream()
+                .collect(Collectors.groupingBy(SearchDocumentResult::meetingId, LinkedHashMap::new, Collectors.toList()))
+                .entrySet()
+                .stream()
+                .map(group -> Map.<String, Object>of(
+                        "meetingId", group.getKey(),
+                        "documents", evidence(group.getValue())
+                ))
+                .toList();
     }
 
     private List<Map<String, Object>> evidence(List<SearchDocumentResult> documents) {

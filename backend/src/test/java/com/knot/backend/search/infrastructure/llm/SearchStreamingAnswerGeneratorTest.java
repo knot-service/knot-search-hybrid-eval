@@ -219,6 +219,38 @@ class SearchStreamingAnswerGeneratorTest {
     }
 
     @Test
+    @DisplayName("시각이 같은 문서도 회의 ID로 구분하고 출처에는 문서 ID를 쓴다")
+    void generateGrounded_groupsEvidenceByMeetingId() {
+        String first = "회의 시각(한국): 2026-10-27 15:14:15 +09:00\n도입 여부가 아직 확정되지 않았다.";
+        String next = "회의 시각(한국): 2026-10-27 15:14:15 +09:00\n도입을 진행하기로 결정했다.";
+        List<SearchDocumentResult> documents = List.of(
+                new SearchDocumentResult(1, "첫 회의", "도입", first, List.of("도입 여부가 아직 확정되지 않았다."), 171L),
+                new SearchDocumentResult(2, "다음 회의", "도입", next, List.of("도입을 진행하기로 결정했다."), 172L),
+                new SearchDocumentResult(3, "첫 회의 추가 문서", "도입", first, List.of("도입 여부가 아직 확정되지 않았다."), 171L)
+        );
+        doAnswer(call -> {
+            List<Map<String, Object>> messages = call.getArgument(1);
+            JsonNode groups = mapper.readTree((String) messages.getLast().get("content")).path("evidence");
+            assertThat(groups.size()).isEqualTo(2);
+            assertThat(groups.get(0).path("meetingId").asLong()).isEqualTo(171L);
+            assertThat(groups.get(0).path("documents").get(1).path("evidenceId").asString()).isEqualTo("E3");
+            assertThat(groups.get(1).path("meetingId").asLong()).isEqualTo(172L);
+            assertThat(groups.get(1).path("documents").get(0).path("evidenceId").asString()).isEqualTo("E2");
+            Consumer<String> consumer = call.getArgument(2);
+            consumer.accept("""
+                    {"claims":[{"text":"첫 회의에서 도입은 미정이었다.","sources":[
+                    {"evidenceId":"E1","quote":"도입 여부가 아직 확정되지 않았다."}]}],"insufficient":false}
+                    """);
+            return null;
+        }).when(llm).streamStructuredAnswer(eq(scope), any(), any());
+
+        List<String> deltas = new ArrayList<>();
+        assertThat(generator.generateGrounded(scope, "도입이 확정됐어?", documents, deltas::add))
+                .containsExactly(1L);
+        assertThat(deltas.getFirst()).contains("도입은 미정", "문서 #1");
+    }
+
+    @Test
     @DisplayName("모델 스트림이 끊기면 JSON 외피 없이 이미 받은 답변만 보존한다")
     void generate_failure_interruptedStreamPreservesPartialAnswer() {
         List<String> deltas = new ArrayList<>();

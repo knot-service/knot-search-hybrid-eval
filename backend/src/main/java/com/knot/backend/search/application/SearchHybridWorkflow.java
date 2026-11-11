@@ -46,6 +46,7 @@ public class SearchHybridWorkflow {
     private final Set<Long> workspaces;
     private final boolean evidenceExpansion;
     private final int evidenceExpansionBudget;
+    private final boolean groupMeetingEvidence;
 
     public SearchHybridWorkflow(
             SearchHybridIndexClient index,
@@ -54,7 +55,8 @@ public class SearchHybridWorkflow {
             SearchToolAccess access,
             @Value("${knot.search.hybrid.workspaces:}") Set<Long> workspaces,
             @Value("${knot.search.hybrid.evidence-expansion:false}") boolean evidenceExpansion,
-            @Value("${knot.search.hybrid.evidence-expansion-budget:3072}") int evidenceExpansionBudget
+            @Value("${knot.search.hybrid.evidence-expansion-budget:3072}") int evidenceExpansionBudget,
+            @Value("${knot.search.hybrid.group-meeting-evidence:false}") boolean groupMeetingEvidence
     ) {
         this.index = index;
         this.documentScope = documentScope;
@@ -67,6 +69,7 @@ public class SearchHybridWorkflow {
             throw new IllegalArgumentException("Hybrid evidence expansion budget must be between 3072 and 6144");
         }
         this.evidenceExpansionBudget = evidenceExpansionBudget;
+        this.groupMeetingEvidence = groupMeetingEvidence;
     }
 
     public boolean enabledFor(long workspaceId) {
@@ -267,6 +270,7 @@ public class SearchHybridWorkflow {
                 .filter(passage -> allowed.containsKey(passage.documentId()))
                 .forEach(passage -> byDocument.computeIfAbsent(passage.documentId(), key -> new ArrayList<>()).add(passage));
         var shortByDocument = shortPassages.stream().collect(Collectors.groupingBy(Passage::documentId));
+        boolean groupByMeeting = groupMeetingEvidence && question.route() == Route.MULTI_MEETING_SYNTHESIS;
         var entries = byDocument.entrySet()
                 .stream();
         if (question.route() == Route.MULTI_MEETING_SYNTHESIS) {
@@ -287,7 +291,8 @@ public class SearchHybridWorkflow {
                                         doc,
                                         entry.getValue(),
                                         shortByDocument.getOrDefault(entry.getKey(), List.of()),
-                                        verified
+                                        verified,
+                                        groupByMeeting ? allowed.get(entry.getKey()).meetingId() : null
                                 )
                         )
         )
@@ -299,7 +304,8 @@ public class SearchHybridWorkflow {
             SearchDocumentRecord doc,
             List<Passage> passages,
             List<Passage> shortPassages,
-            List<Passage> verified
+            List<Passage> verified,
+            Long meetingId
     ) {
         List<Passage> valid = passages.stream()
                 .filter(
@@ -328,7 +334,8 @@ public class SearchHybridWorkflow {
                         doc.title(),
                         doc.topic(),
                         text,
-                        quotes
+                        quotes,
+                        meetingId
                 )
         );
     }
