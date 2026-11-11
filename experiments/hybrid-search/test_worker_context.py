@@ -1,9 +1,10 @@
+from threading import Lock
 from unittest import TestCase
 
 from build_dataset import SourceDoc
 from phase1 import Hit
 from phase3 import CONTEXT_BUDGET, assemble, assemble_worker_context
-from phase4_retrieval import RetrievalSettings, Retriever, prefer_source_text
+from phase4_retrieval import RankRequest, RetrievalSettings, Retriever, prefer_source_text
 
 
 def document(doc_id: int, body: str) -> SourceDoc:
@@ -16,6 +17,34 @@ def character_offsets(text: str, **_options) -> dict:
 
 
 class WorkerContextTest(TestCase):
+    def test_support_uses_the_shared_budget_and_does_not_replace_representatives(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.source = {
+            1: document(1, "가" * 70),
+            2: document(2, "나" * 30).model_copy(update={"meetingId": 1}),
+            3: document(3, "다" * 30),
+            4: document(4, "라" * 30),
+        }
+        retriever.tokenizer = character_offsets
+        hits = tuple(Hit(documentId=i, field="body", start=0, end=len(doc.body))
+                     for i, doc in retriever.source.items() if i != 4)
+
+        class Reranker:
+            def predict(self, pairs, **options):
+                return (5.0, 4.0, 3.0)
+
+        settings = RetrievalSettings(
+            context_budget=100, supporting_excerpt_tokens=20, supporting_reserve_tokens=20,
+        )
+        response = retriever.with_context(
+            RankRequest(workspaceId=1, question="근거", allowedDocumentIds=(1, 2, 3), contextMode="synthesis"),
+            hits, Reranker(), Lock(), Lock(), settings,
+        )
+
+        self.assertEqual([1, 3], [passage.documentId for passage in response.passages])
+        self.assertEqual([2], [passage.documentId for passage in response.supportingPassages])
+        self.assertEqual(100, sum(p.tokenCount for p in (*response.passages, *response.supportingPassages)))
+
     def test_representative_can_change_document_without_changing_the_selected_meetings(self):
         retriever = Retriever.__new__(Retriever)
         retriever.source = {

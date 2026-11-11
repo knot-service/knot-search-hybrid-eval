@@ -11,12 +11,14 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
@@ -26,6 +28,8 @@ import org.springframework.stereotype.Component;
 public class SearchHybridWorkflow {
     private static final int LIMIT = 10;
     private static final int CONTEXT_TOKENS = 3072;
+    private static final int SUPPORTING_CONTEXT_TOKENS = 2048;
+    private static final int MAX_PASSAGES_PER_KIND = 5;
     private static final DateTimeFormatter MEETING_TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss XXX")
             .withZone(ZoneId.of("Asia/Seoul"));
 
@@ -110,6 +114,7 @@ public class SearchHybridWorkflow {
                     scope,
                     question,
                     ranking.passages(),
+                    ranking.supportingPassages(),
                     allowed,
                     verified
             );
@@ -183,17 +188,32 @@ public class SearchHybridWorkflow {
             SearchToolScope scope,
             SearchHybridQuestion question,
             List<Passage> passages,
+            List<Passage> supportingPassages,
             Map<Long, EligibleDocument> allowed,
             List<Passage> verified
     ) {
-        if (passages == null || passages.size() > 5 || passages.stream()
-                .anyMatch(p -> p.tokenCount() < 1)
-                || passages.stream()
-                        .mapToLong(Passage::tokenCount)
-                        .sum() > CONTEXT_TOKENS) {
+        if (passages == null || passages.size() > MAX_PASSAGES_PER_KIND
+                || supportingPassages.size() > MAX_PASSAGES_PER_KIND) {
             throw new IllegalStateException("Invalid hybrid context budget");
         }
-        Map<Long, List<Passage>> byDocument = passages.stream()
+        var allPassages = Stream.concat(passages.stream(), supportingPassages.stream()).toList();
+        int budget = supportingPassages.isEmpty() ? CONTEXT_TOKENS : SUPPORTING_CONTEXT_TOKENS;
+        if (allPassages.stream().anyMatch(p -> p.tokenCount() < 1)
+                || allPassages.stream().mapToLong(Passage::tokenCount).sum() > budget) {
+            throw new IllegalStateException("Invalid hybrid context budget");
+        }
+        var primaryDocuments = passages.stream().map(Passage::documentId).filter(allowed::containsKey)
+                .collect(Collectors.toSet());
+        var primaryMeetings = primaryDocuments.stream().map(id -> allowed.get(id).meetingId())
+                .collect(Collectors.toSet());
+        var supportedMeetings = new HashSet<Long>();
+        var eligibleSupport = supportingPassages.stream()
+                .filter(p -> allowed.containsKey(p.documentId()) && !primaryDocuments.contains(p.documentId()))
+                .filter(p -> {
+                    long meeting = allowed.get(p.documentId()).meetingId();
+                    return primaryMeetings.contains(meeting) && supportedMeetings.add(meeting);
+                });
+        Map<Long, List<Passage>> byDocument = Stream.concat(passages.stream(), eligibleSupport)
                 .filter(p -> allowed.containsKey(p.documentId()))
                 .collect(
                         Collectors.groupingBy(

@@ -22,7 +22,7 @@ from experiment import MODEL, REVISION, tokens
 from phase1 import Hit, chunks, prepare
 from phase2 import DEPTH, fuse, ms
 from phase3 import (
-    CONTEXT_BUDGET, CONTEXT_COUNT, RERANKER, RERANKER_REVISION,
+    CONTEXT_BUDGET, CONTEXT_COUNT, RERANKER, RERANKER_REVISION, Context,
     adjacent_paragraphs, assemble_worker_context, material,
 )
 
@@ -40,6 +40,10 @@ class RetrievalSettings(Frozen):
     representative_rrf_bonus: float = 0.0
     representatives_only_when_full: bool = True
     expand_source_window: bool = False
+    supporting_excerpt_tokens: int = 0
+    supporting_reserve_tokens: int = 0
+    supporting_lexical_bonus: float = 0.0
+    supporting_in_questions: bool = False
     keyword_depth: int = DEPTH
     vector_depth: int = DEPTH
     fusion_depth: int | None = DEPTH
@@ -65,6 +69,11 @@ EXPANDED_REPRESENTATIVE_SETTINGS = SPARE_SLOT_SETTINGS.model_copy(update={
     "expand_source_window": True,
     "context_budget": 3072,
 })
+SUPPORTING_DOCUMENT_SETTINGS = SPARE_SLOT_SETTINGS.model_copy(update={
+    "supporting_excerpt_tokens": 220,
+    "supporting_lexical_bonus": 8.0,
+    "supporting_in_questions": True,
+})
 
 
 class RankRequest(Frozen):
@@ -83,6 +92,7 @@ class Passage(Hit):
 class RankResponse(Frozen):
     documentIds: tuple[int, ...]
     passages: tuple[Passage, ...] = ()
+    supportingPassages: tuple[Passage, ...] = ()
     rerankMs: float = 0
     contextMs: float = 0
 
@@ -180,15 +190,63 @@ class Retriever:
                     })
                     extents[hit] = adjacent_paragraphs(self.source[hit.documentId], combined)
         with tokenizer_lock:
+            focus = request.question if settings.sentence_focus else ""
             contexts = assemble_worker_context(
                 selected, self.source, self.tokenizer, limits, budget=settings.context_budget,
-                focus=request.question if settings.sentence_focus else "", extents=extents,
+                focus=focus, extents=extents,
             )
-        passages = tuple(Passage(**item.hit.model_dump(), tokenCount=item.tokenCount,
-                                 quote=material(self.source[item.hit.documentId], item.hit)[item.hit.start:item.hit.end])
-                         for item in contexts)
-        return RankResponse(documentIds=document_ids, passages=passages,
+            supports = ()
+            if settings.supporting_excerpt_tokens and (
+                request.contextMode == "synthesis" or settings.supporting_in_questions
+            ):
+                primary_tokens = sum(item.tokenCount for item in contexts)
+                remaining = settings.context_budget - primary_tokens
+                support_budget = remaining + settings.supporting_reserve_tokens
+                if support_budget:
+                    primary_hits = tuple(item.hit for item in contexts)
+                    extras = self.supporting_documents(request.question, primary_hits, ranked, relevance, settings)
+                    supports = assemble_worker_context(
+                        extras, self.source, self.tokenizer,
+                        dict.fromkeys(extras, settings.supporting_excerpt_tokens),
+                        budget=support_budget, focus=request.question,
+                    )
+                    extra_tokens = sum(item.tokenCount for item in supports)
+                    if extra_tokens > remaining:
+                        contexts = assemble_worker_context(
+                            selected, self.source, self.tokenizer, limits,
+                            budget=settings.context_budget - extra_tokens, focus=focus, extents=extents,
+                        )
+        return RankResponse(documentIds=document_ids, passages=self.passages(contexts),
+                            supportingPassages=self.passages(supports),
                             rerankMs=rerank_ms, contextMs=ms(started))
+
+    def passages(self, contexts: tuple[Context, ...]) -> tuple[Passage, ...]:
+        return tuple(Passage(**item.hit.model_dump(), tokenCount=item.tokenCount,
+                             quote=material(self.source[item.hit.documentId], item.hit)[item.hit.start:item.hit.end])
+                     for item in contexts)
+
+    def supporting_documents(
+        self, question: str, primary: tuple[Hit, ...], ranked: tuple[Hit, ...],
+        relevance: dict[Hit, float], settings: RetrievalSettings,
+    ) -> tuple[Hit, ...]:
+        documents = {hit.documentId for hit in primary}
+        meetings = {self.source[doc].meetingId for doc in documents}
+        eligible = tuple(hit for hit in ranked if hit.documentId not in documents
+                         and self.source[hit.documentId].meetingId in meetings)
+        if not eligible:
+            return ()
+        existing = [passage_terms(self.source[hit.documentId], hit) for hit in primary]
+        lexical = (self.representative_lexical_scores(question, eligible)
+                   if settings.supporting_lexical_bonus else {})
+        scores = {}
+        for hit in eligible:
+            terms = passage_terms(self.source[hit.documentId], hit)
+            overlap = max(passage_overlap(terms, terms_in_primary) for terms_in_primary in existing)
+            scores[hit] = relevance[hit] - overlap + settings.supporting_lexical_bonus * lexical.get(hit, 0.0)
+        chosen = {}
+        for hit in sorted(eligible, key=scores.__getitem__, reverse=True):
+            chosen.setdefault(self.source[hit.documentId].meetingId, hit)
+        return tuple(chosen.values())
 
     @staticmethod
     def by_document(ranked: tuple[Hit, ...]) -> tuple[Hit, ...]:
@@ -332,10 +390,11 @@ def prefer_source_text(selected: tuple[Hit, ...], ranked: tuple[Hit, ...],
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     torch.set_num_threads(4)
-    app.state.worker_settings = (
-        EXPANDED_REPRESENTATIVE_SETTINGS
-        if os.environ.get("KNOT_HYBRID_EXPAND_CONTEXT") == "true" else SPARE_SLOT_SETTINGS
-    )
+    app.state.worker_settings = SPARE_SLOT_SETTINGS
+    if os.environ.get("KNOT_HYBRID_SUPPORTING_CONTEXT") == "true":
+        app.state.worker_settings = SUPPORTING_DOCUMENT_SETTINGS
+    elif os.environ.get("KNOT_HYBRID_EXPAND_CONTEXT") == "true":
+        app.state.worker_settings = EXPANDED_REPRESENTATIVE_SETTINGS
     model = SentenceTransformer(MODEL, revision=REVISION, device="cpu")
     app.state.retrievers = {workspace: Retriever(model, workspace) for workspace in (1, 458)}
     model.encode(["query: 워밍업"], normalize_embeddings=True, show_progress_bar=False)
