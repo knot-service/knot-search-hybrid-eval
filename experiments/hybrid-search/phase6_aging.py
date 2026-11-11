@@ -66,12 +66,26 @@ def compare(before_dir: Path, after_dir: Path, pattern: str, meetings: dict) -> 
     return result
 
 
+def sweep(runs: list[dict]) -> dict:
+    ordered = sorted(runs, key=lambda run: run["promotionWaitMs"])
+    waits = {run["promotionWaitMs"] for run in ordered}
+    if len(waits) != len(ordered):
+        raise ValueError("Each threshold may be measured only once in the comparison.")
+    result = {
+        "before": ordered[0]["before"],
+        "variants": [{key: value for key, value in run.items() if key != "before"} for run in ordered],
+    }
+    return result
+
+
 if __name__ == "__main__":
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("balanced_before", type=Path)
     parser.add_argument("balanced_after", type=Path)
     parser.add_argument("surge_before", type=Path)
     parser.add_argument("surge_after", type=Path)
+    parser.add_argument("--candidate", nargs=2, action="append", type=Path, metavar=("BALANCED_DIR", "SURGE_DIR"),
+                        help="Compare one more threshold against the same baselines")
     args = parser.parse_args()
     meetings = {workspace["id"]: {doc["id"]: doc["meetingId"] for doc in workspace["documents"]}
                 for workspace in read("phase5-fixtures.json")["workspaces"]}
@@ -79,4 +93,17 @@ if __name__ == "__main__":
     surge = compare(args.surge_before, args.surge_after, "question_surge", meetings)
     if balanced["promotionWaitMs"] != surge["promotionWaitMs"]:
         raise ValueError("The promotion thresholds differ.")
-    print(write(str(args.balanced_after / "phase6-aging-comparison.json"), {"balanced": balanced, "surge": surge}))
+    if not args.candidate:
+        print(write(str(args.balanced_after / "phase6-aging-comparison.json"), {"balanced": balanced, "surge": surge}))
+    else:
+        balanced_runs = [balanced]
+        surge_runs = [surge]
+        for balanced_dir, surge_dir in args.candidate:
+            balanced_run = compare(args.balanced_before, balanced_dir, "balanced", meetings)
+            surge_run = compare(args.surge_before, surge_dir, "question_surge", meetings)
+            if balanced_run["promotionWaitMs"] != surge_run["promotionWaitMs"]:
+                raise ValueError("The promotion thresholds differ.")
+            balanced_runs.append(balanced_run)
+            surge_runs.append(surge_run)
+        output = args.candidate[-1][0] / "phase6-aging-threshold-sweep.json"
+        print(write(str(output), {"balanced": sweep(balanced_runs), "surge": sweep(surge_runs)}))
