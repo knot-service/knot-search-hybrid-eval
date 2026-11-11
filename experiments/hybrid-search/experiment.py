@@ -336,3 +336,29 @@ def run(kind: Kind, request: Request) -> Run:
     tmp.write_text(result.model_dump_json(indent=2), encoding="utf-8")
     tmp.replace(path)
     return result
+
+
+class CorpusSummary(FrozenModel):
+    workspaceId: int
+    source: str
+    documentCount: int
+    meetingCount: int
+    minCharacters: int
+    meanCharacters: float
+    maxCharacters: int
+
+
+@app.get("/workspaces")
+def workspaces() -> tuple[CorpusSummary, ...]:
+    with connect() as db:
+        rows = db.execute(
+            """select w.id,w.source,count(d.id),count(distinct d.meeting_id),
+               min(length(d.body)),avg(length(d.body)),max(length(d.body))
+               from workspaces w join documents d on d.workspace_id=w.id
+               group by w.id order by w.id"""
+        ).fetchall()
+    return tuple(CorpusSummary(
+        workspaceId=workspace_id, source=source, documentCount=documents,
+        meetingCount=meetings, minCharacters=minimum, meanCharacters=float(average),
+        maxCharacters=maximum,
+    ) for workspace_id, source, documents, meetings, minimum, average, maximum in rows)
