@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import datetime
 from hashlib import sha256
 import json
+import re
 from statistics import mean
 from time import perf_counter
 from typing import Final
@@ -14,7 +15,7 @@ import torch
 
 from build_dataset import Frozen, SourceDoc, documents
 from database import LOCAL
-from experiment import MODEL, REVISION
+from experiment import MODEL, REVISION, tokens
 from phase1 import Draft, DraftCase, Hit, rank_quality
 from phase2 import ms, percentiles
 
@@ -140,7 +141,8 @@ def assemble(
 
 def assemble_worker_context(
     hits: tuple[Hit, ...], source: dict[int, SourceDoc],
-    tokenizer: PreTrainedTokenizerFast, limits: dict[Hit, int],
+    tokenizer: PreTrainedTokenizerFast, limits: dict[Hit, int], *,
+    budget: int = CONTEXT_BUDGET, focus: str = "",
 ) -> tuple[Context, ...]:
     windows = []
     for hit in hits[:CONTEXT_COUNT]:
@@ -154,12 +156,12 @@ def assemble_worker_context(
                             if extent.start + end > hit.start), len(offsets))
         child_end = next((i for i, (start, _) in enumerate(offsets)
                           if extent.start + start >= hit.end), len(offsets))
-        limit = limits.get(hit, CONTEXT_BUDGET)
+        limit = limits.get(hit, budget)
         windows.append((extent, offsets, child_start, min(child_end - child_start, limit), min(len(offsets), limit)))
 
     # Spend the shared budget on matching children before expanding any Parent.
     budgets = [0] * len(windows)
-    remaining = CONTEXT_BUDGET
+    remaining = budget
     for limits_by_window in ([window[3] for window in windows], [window[4] for window in windows]):
         while remaining and (open_windows := [i for i, limit in enumerate(limits_by_window) if budgets[i] < limit]):
             share = max(1, remaining // len(open_windows))
@@ -173,6 +175,9 @@ def assemble_worker_context(
         if not taken:
             continue
         first = min(child_start, len(offsets) - taken)
+        if focus and taken < len(offsets):
+            text = material(source[extent.documentId], extent)[extent.start:extent.end]
+            first = focused_start(text, offsets, taken, focus, first)
         passage = extent.model_copy(update={
             "start": extent.start + offsets[first][0],
             "end": extent.start + offsets[first + taken - 1][1],
@@ -181,6 +186,25 @@ def assemble_worker_context(
                    and item.hit.start <= passage.start and item.hit.end >= passage.end for item in contexts):
             contexts.append(Context(hit=passage, tokenCount=taken))
     return tuple(contexts)
+
+
+def focused_start(text: str, offsets: list[tuple[int, int]], taken: int, question: str, fallback: int) -> int:
+    terms = set(tokens(question))
+    boundaries = [0, *(m.end() for m in re.finditer(r"\n+|[.!?。！？](?=\s|$)", text)), len(text)]
+    best = (0, 0)
+    anchor = fallback
+    for start, end in zip(boundaries, boundaries[1:]):
+        overlap = len(terms.intersection(tokens(text[start:end])))
+        if not overlap:
+            continue
+        left = next((i for i, (_, token_end) in enumerate(offsets) if token_end > start), len(offsets))
+        right = next((i for i, (token_start, _) in enumerate(offsets) if token_start >= end), len(offsets))
+        score = (overlap, -abs(left - fallback))
+        if left < right and score > best:
+            best = score
+            anchor = min(max(0, right - taken, left - max(0, taken - (right - left)) // 2),
+                         left, len(offsets) - taken)
+    return anchor
 
 
 def quality(

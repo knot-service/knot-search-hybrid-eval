@@ -1,9 +1,12 @@
 """Loopback-only scoped retrieval and evidence selection for the Spring Worker."""
 from contextlib import asynccontextmanager
 from datetime import datetime
+from hashlib import sha256
+import os
+from pathlib import Path
 from time import perf_counter
 from threading import Lock
-from typing import Literal
+from typing import Callable, Literal
 
 import torch
 from fastapi import FastAPI, Request
@@ -13,16 +16,42 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from transformers import PreTrainedTokenizerFast
 
-from build_dataset import Frozen, documents
+from build_dataset import Frozen, SourceDoc, documents
 from database import connect, vector_literal
 from experiment import MODEL, REVISION, tokens
 from phase1 import Hit, chunks, prepare
 from phase2 import DEPTH, fuse, ms
-from phase3 import CONTEXT_COUNT, RERANKER, RERANKER_REVISION, assemble_worker_context, material
+from phase3 import (
+    CONTEXT_BUDGET, CONTEXT_COUNT, RERANKER, RERANKER_REVISION,
+    adjacent_paragraphs, assemble_worker_context, material,
+)
 
 BODY_SCORE_MARGIN = 1.0
 WEAK_SCORE_GAP = 6.25
 WEAK_PASSAGE_TOKENS = 96
+
+
+class RetrievalSettings(Frozen):
+    supplement: Literal["none", "document", "chunk", "both"] = "none"
+    supplement_overlap_penalty: float = 0.0
+    reuse_spare_slots: bool = False
+    keyword_depth: int = DEPTH
+    vector_depth: int = DEPTH
+    fusion_depth: int | None = DEPTH
+    fusion_reserve: int = 0
+    context_budget: int = CONTEXT_BUDGET
+    weak_passage_tokens: int | None = WEAK_PASSAGE_TOKENS
+    sentence_focus: bool = False
+
+
+BASELINE = RetrievalSettings()
+WORKER_SETTINGS = RetrievalSettings(
+    supplement="both",
+    supplement_overlap_penalty=1.0,
+    keyword_depth=40,
+    context_budget=2048,
+    sentence_focus=True,
+)
 
 
 class RankRequest(Frozen):
@@ -69,7 +98,13 @@ class Retriever:
             if existing != set(self.hits):
                 prepare(db, source, model, workspace_id=workspace_id, modes=("fixed",))
 
-    def rank(self, question: str, embedding: str, allowed_ids: tuple[int, ...]) -> tuple[Hit, ...]:
+    def rank(self, question: str, embedding: str, allowed_ids: tuple[int, ...],
+             settings: RetrievalSettings = BASELINE) -> tuple[Hit, ...]:
+        keyword, vector = self.rank_sources(question, embedding, allowed_ids, settings)
+        return fuse(keyword, vector, settings.fusion_depth, settings.fusion_reserve)
+
+    def rank_sources(self, question: str, embedding: str, allowed_ids: tuple[int, ...],
+                     settings: RetrievalSettings) -> tuple[tuple[Hit, ...], tuple[Hit, ...]]:
         allowed = set(allowed_ids)
         with connect() as db:
             vector = tuple(Hit(documentId=doc, field=field, start=left, end=right)
@@ -77,15 +112,17 @@ class Retriever:
                 """select document_id,field,start_offset,end_offset
                    from workspace1_chunks where workspace_id=%s and mode='fixed' and document_id=any(%s)
                    order by embedding <=> %s::vector,document_id,field,start_offset limit %s""",
-                (self.workspace_id, list(allowed), embedding, DEPTH),
+                (self.workspace_id, list(allowed), embedding, settings.vector_depth),
             ))
         scores = self.keyword.get_scores(tokens(question))
         matching = (i for i, hit in enumerate(self.hits) if hit.documentId in allowed and scores[i] > 0)
-        keyword = tuple(self.hits[i] for i in sorted(matching, key=lambda i: (-scores[i], i))[:DEPTH])
-        return fuse(keyword, vector)
+        keyword = tuple(self.hits[i] for i in sorted(matching, key=lambda i: (-scores[i], i))[:settings.keyword_depth])
+        return keyword, vector
 
     def with_context(self, request: RankRequest, candidates: tuple[Hit, ...],
-                     reranker: CrossEncoder, rerank_lock: Lock, tokenizer_lock: Lock) -> RankResponse:
+                     reranker: CrossEncoder, rerank_lock: Lock, tokenizer_lock: Lock,
+                     settings: RetrievalSettings = BASELINE, *,
+                     on_selected: Callable[[tuple[Hit, ...]], None] | None = None) -> RankResponse:
         document_ids = tuple(dict.fromkeys(hit.documentId for hit in candidates))
         if request.contextMode == "none" or not candidates:
             return RankResponse(documentIds=document_ids)
@@ -104,11 +141,20 @@ class Retriever:
         else:
             selected = self.by_document(ranked)
         selected = prefer_source_text(selected, ranked, relevance)
+        if request.contextMode == "synthesis" and settings.supplement != "none":
+            selected = self.supplement(selected, ranked, settings.supplement, relevance,
+                                       overlap_penalty=settings.supplement_overlap_penalty,
+                                       reuse_spare_slots=settings.reuse_spare_slots)
+        if on_selected is not None:
+            on_selected(selected)
         best = relevance[ranked[0]]
-        limits = {hit: WEAK_PASSAGE_TOKENS for hit in selected
-                  if best >= 0 and best - relevance[hit] > WEAK_SCORE_GAP}
+        limits = {hit: settings.weak_passage_tokens for hit in selected
+                  if settings.weak_passage_tokens is not None and best >= 0 and best - relevance[hit] > WEAK_SCORE_GAP}
         with tokenizer_lock:
-            contexts = assemble_worker_context(selected, self.source, self.tokenizer, limits)
+            contexts = assemble_worker_context(
+                selected, self.source, self.tokenizer, limits, budget=settings.context_budget,
+                focus=request.question if settings.sentence_focus else "",
+            )
         passages = tuple(Passage(**item.hit.model_dump(), tokenCount=item.tokenCount,
                                  quote=material(self.source[item.hit.documentId], item.hit)[item.hit.start:item.hit.end])
                          for item in contexts)
@@ -137,6 +183,62 @@ class Retriever:
             meetings.sort(key=recorded, reverse=True)
             meetings = meetings[:recent]
         return tuple(meetings[:CONTEXT_COUNT])
+
+    def supplement(self, representatives: tuple[Hit, ...], ranked: tuple[Hit, ...],
+                   mode: Literal["document", "chunk", "both"], relevance: dict[Hit, float], *,
+                   overlap_penalty: float = 0.0, reuse_spare_slots: bool = False) -> tuple[Hit, ...]:
+        if len(representatives) >= CONTEXT_COUNT:
+            return representatives
+        by_meeting = {self.source[hit.documentId].meetingId: hit for hit in representatives}
+        eligible = []
+        for hit in ranked:
+            meeting = self.source[hit.documentId].meetingId
+            representative = by_meeting.get(meeting)
+            if representative is None:
+                continue
+            other_document = hit.documentId != representative.documentId
+            distinct_chunk = (hit.field == representative.field
+                              and (hit.end <= representative.start or representative.end <= hit.start))
+            if ((other_document and mode in ("document", "both"))
+                    or (not other_document and distinct_chunk and mode in ("chunk", "both"))):
+                eligible.append((meeting, hit))
+        selected = list(representatives)
+        windows = {}
+        if overlap_penalty and eligible:
+            windows = {hit: passage_terms(self.source[hit.documentId], hit)
+                       for hit in (*representatives, *(hit for _, hit in eligible))}
+
+        supplemented_meetings = set()
+        while eligible and len(selected) < CONTEXT_COUNT:
+            choices = [item for item in eligible if item[0] not in supplemented_meetings]
+            if not choices and not reuse_spare_slots:
+                break
+            choices = choices or eligible
+            meeting, hit = choices[0]
+            if windows:
+                meeting, hit = max(choices, key=lambda item: relevance[item[1]] - overlap_penalty * max(
+                    passage_overlap(windows[item[1]], windows[chosen]) for chosen in selected
+                ))
+            selected.append(hit)
+            supplemented_meetings.add(meeting)
+            eligible = [(other_meeting, other_hit) for other_meeting, other_hit in eligible
+                        if not (
+                            other_hit.documentId == hit.documentId and other_hit.field == hit.field
+                            and other_hit.start < hit.end and hit.start < other_hit.end
+                        )]
+        return tuple(selected)
+
+
+def passage_terms(document: SourceDoc, hit: Hit) -> set[tuple[str, ...]]:
+    window = adjacent_paragraphs(document, hit)
+    terms = tokens(material(document, window)[window.start:window.end])
+    if len(terms) < 3:
+        return {tuple(terms)} if terms else set()
+    return set(zip(terms, terms[1:], terms[2:]))
+
+
+def passage_overlap(left: set[tuple[str, ...]], right: set[tuple[str, ...]]) -> float:
+    return len(left & right) / max(1, min(len(left), len(right)))
 
 
 def prefer_source_text(selected: tuple[Hit, ...], ranked: tuple[Hit, ...],
@@ -170,6 +272,13 @@ async def lifespan(app: FastAPI):
                                       device="cpu", trust_remote_code=False)
     app.state.reranker.predict([("워밍업", "검색 예시")], show_progress_bar=False)
     app.state.rerank_lock = Lock()
+    trace_path = os.environ.get("KNOT_ACCURACY_TRACE")
+    if trace_path:
+        app.state.accuracy_trace = Path(trace_path)
+        app.state.accuracy_trace.touch(mode=0o600, exist_ok=False)
+        app.state.accuracy_trace_lock = Lock()
+    else:
+        app.state.accuracy_trace = None
     yield
 
 
@@ -179,12 +288,18 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1
 
 @app.post("/rank", response_model=RankResponse)
 def rank(data: RankRequest, request: Request) -> RankResponse:
+    trace = request.app.state.accuracy_trace
+    if trace is not None:
+        row = data.model_copy(update={"question": sha256(data.question.encode()).hexdigest()})
+        with request.app.state.accuracy_trace_lock, trace.open("a") as output:
+            output.write(row.model_dump_json() + "\n")
     if not data.allowedDocumentIds:
         return RankResponse(documentIds=())
     with request.app.state.embed_lock:
         query = request.app.state.model.encode([f"query: {data.question}"], normalize_embeddings=True,
                                                show_progress_bar=False)[0]
     retriever = request.app.state.retrievers[data.workspaceId]
-    candidates = retriever.rank(data.question, vector_literal(query.tolist()), data.allowedDocumentIds)
+    settings = BASELINE if data.contextMode == "none" else WORKER_SETTINGS
+    candidates = retriever.rank(data.question, vector_literal(query.tolist()), data.allowedDocumentIds, settings)
     return retriever.with_context(data, candidates, request.app.state.reranker, request.app.state.rerank_lock,
-                                  request.app.state.embed_lock)
+                                  request.app.state.embed_lock, settings)

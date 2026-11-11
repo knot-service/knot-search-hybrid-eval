@@ -2,6 +2,7 @@
 from datetime import datetime
 from hashlib import sha256
 import json
+from itertools import islice
 from statistics import mean
 from time import perf_counter
 from typing import Final
@@ -64,12 +65,19 @@ def diversify(ranking: tuple[Hit, ...]) -> tuple[Hit, ...]:
     return (*first_by_document.values(), *remaining)
 
 
-def fuse(keyword: tuple[Hit, ...], vector: tuple[Hit, ...]) -> tuple[Hit, ...]:
+def fuse(keyword: tuple[Hit, ...], vector: tuple[Hit, ...], limit: int | None = DEPTH,
+         reserve_per_source: int = 0) -> tuple[Hit, ...]:
     fused: dict[Hit, float] = {}
     for hits in (keyword, vector):
         for rank, hit in enumerate(hits, 1):
             fused[hit] = fused.get(hit, 0.0) + 1 / (RRF_K + rank)
-    return tuple(sorted(fused, key=lambda hit: (-fused[hit], hit.documentId, hit.field, hit.start)))[:DEPTH]
+    ranked = tuple(sorted(fused, key=lambda hit: (-fused[hit], hit.documentId, hit.field, hit.start)))
+    if not reserve_per_source or limit is None:
+        return ranked[:limit]
+    reserved = set(keyword[:reserve_per_source] + vector[:reserve_per_source])
+    remaining = (hit for hit in ranked if hit not in reserved)
+    chosen = reserved | set(islice(remaining, max(0, limit - len(reserved))))
+    return tuple(hit for hit in ranked if hit in chosen)[:limit]
 
 
 def measure(case: DraftCase, hits: tuple[Hit, ...], elapsed_ms: float) -> Ranking:

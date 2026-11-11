@@ -3,7 +3,7 @@ from unittest import TestCase
 from build_dataset import SourceDoc
 from phase1 import Hit
 from phase3 import CONTEXT_BUDGET, assemble, assemble_worker_context
-from phase4_retrieval import prefer_source_text
+from phase4_retrieval import Retriever, prefer_source_text
 
 
 def document(doc_id: int, body: str) -> SourceDoc:
@@ -16,6 +16,66 @@ def character_offsets(text: str, **_options) -> dict:
 
 
 class WorkerContextTest(TestCase):
+    def test_spare_slots_add_at_most_one_document_from_each_selected_meeting(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.source = {i: document(i, "가" * 40) for i in range(1, 7)}
+        for i, meeting in ((2, 1), (3, 1), (5, 4)):
+            retriever.source[i] = retriever.source[i].model_copy(update={"meetingId": meeting})
+        hits = {i: Hit(documentId=i, field="body", start=0, end=40) for i in retriever.source}
+
+        selected = retriever.supplement((hits[1], hits[4]),
+                                        tuple(hits[i] for i in (6, 1, 2, 3, 4, 5)), "document", {})
+
+        self.assertEqual((hits[1], hits[4], hits[2], hits[5]), selected)
+
+    def test_spare_slot_prefers_relevant_new_information_over_a_duplicate(self):
+        retriever = Retriever.__new__(Retriever)
+        duplicate = "환불 요청 접수 후 결제 승인 번호를 확인한다."
+        complementary = "카드 취소는 영업일 기준 삼일 이내 처리한다."
+        retriever.source = {
+            i: document(i, text).model_copy(update={"meetingId": 1 if i < 4 else i})
+            for i, text in enumerate((duplicate, duplicate, complementary, "다른 회의 문서"), 1)
+        }
+        hits = tuple(Hit(documentId=i, field="body", start=0, end=len(doc.body))
+                     for i, doc in retriever.source.items())
+        representative, copied, additional, outside = hits
+
+        selected = retriever.supplement(
+            (representative,), hits, "both",
+            {representative: 8.0, copied: 7.5, additional: 7.0, outside: 9.0},
+            overlap_penalty=2.0,
+        )
+
+        self.assertEqual((representative, additional), selected)
+
+    def test_reuses_slots_only_after_other_selected_meetings_get_a_supplement(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.source = {
+            i: document(i, "결제 취소 환불 조건 확인").model_copy(update={"meetingId": meeting})
+            for i, meeting in enumerate((1, 1, 1, 2, 2, 3), 1)
+        }
+        hits = tuple(Hit(documentId=i, field="body", start=0, end=len(doc.body))
+                     for i, doc in retriever.source.items())
+        first, first_extra, first_last, second, second_extra, outside = hits
+
+        selected = retriever.supplement(
+            (first, second), (outside, first_extra, first_last, second_extra), "both", {},
+            reuse_spare_slots=True,
+        )
+
+        self.assertEqual((first, second, first_extra, second_extra, first_last), selected)
+
+    def test_focused_excerpt_can_keep_a_matching_sentence_after_the_prefix(self):
+        body = "가" * 50 + "\n환불 기준은 영업일 7일이다."
+        docs = {1: document(1, body)}
+        hit = Hit(documentId=1, field="body", start=0, end=len(body))
+        contexts = assemble_worker_context((hit,), docs, character_offsets, {},
+                                           budget=26, focus="환불 기준 알려줘")
+
+        excerpt = body[contexts[0].hit.start:contexts[0].hit.end]
+        self.assertIn("환불 기준은 영업일 7일이다.", excerpt)
+        self.assertEqual(26, contexts[0].tokenCount)
+
     def test_uses_short_passages_unused_budget_for_earlier_child(self):
         docs = {i: document(i, "가" * length) for i, length in enumerate((350, 320, 320, 20, 10), 1)}
         hits = tuple(Hit(documentId=i, field="body", start=0, end=len(doc.body)) for i, doc in docs.items())

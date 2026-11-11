@@ -25,7 +25,7 @@ import org.springframework.stereotype.Component;
 @ConditionalOnProperty(name = "knot.search.hybrid.index-url")
 public class SearchHybridWorkflow {
     private static final int LIMIT = 10;
-    private static final int CONTEXT_TOKENS = 1024;
+    private static final int CONTEXT_TOKENS = 2048;
     private static final DateTimeFormatter MEETING_TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss XXX")
             .withZone(ZoneId.of("Asia/Seoul"));
 
