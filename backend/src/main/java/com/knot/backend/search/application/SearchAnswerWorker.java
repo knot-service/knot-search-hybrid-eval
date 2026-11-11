@@ -111,7 +111,7 @@ public class SearchAnswerWorker {
                     result.retrievalNanos() / 1_000_000, result.documents().size()
             );
             deliver(work, scope, new SearchRetrievalResult(result.documents(), 0),
-                    result.route() == Route.DOCUMENT_FIND, persistenceCount, persistenceNanos);
+                    result.route(), persistenceCount, persistenceNanos);
             return;
         }
         long classificationStarted = System.nanoTime();
@@ -181,14 +181,14 @@ public class SearchAnswerWorker {
             );
             throw exception;
         }
-        deliver(work, scope, retrieval, false, persistenceCount, persistenceNanos);
+        deliver(work, scope, retrieval, Route.MEETING_QUESTION, persistenceCount, persistenceNanos);
     }
 
     private void deliver(
             SearchAnswerWorkResult work,
             SearchToolScope scope,
             SearchRetrievalResult retrieval,
-            boolean documentFind,
+            Route route,
             AtomicLong persistenceCount,
             AtomicLong persistenceNanos
     ) {
@@ -216,7 +216,7 @@ public class SearchAnswerWorker {
             );
             return;
         }
-        if (documentFind) {
+        if (route == Route.DOCUMENT_FIND) {
             List<SearchDocumentResult> linked = documents.stream().limit(DOCUMENT_LINK_LIMIT).toList();
             List<Long> ids = linked.stream().map(SearchDocumentResult::documentId).toList();
             String titles = linked.stream()
@@ -238,12 +238,7 @@ public class SearchAnswerWorker {
         )) {
             long generationStarted = System.nanoTime();
             try {
-                usedIds = generator.generate(
-                        scope,
-                        work.question(),
-                        documents,
-                        content
-                );
+                usedIds = generateAnswer(generator, route, scope, work.question(), documents, content);
                 log.info(
                         "Search latency phase=answer_generation workspaceId={} answerId={} elapsedMs={} inputChars={} documentCount={} outcome=success",
                         work.workspaceId(),
@@ -275,6 +270,20 @@ public class SearchAnswerWorker {
                 usedIds,
                 candidates
         );
+    }
+
+    private List<Long> generateAnswer(
+            SearchAnswerGenerator generator,
+            Route route,
+            SearchToolScope scope,
+            String question,
+            List<SearchDocumentResult> documents,
+            SearchAnswerContentBuffer content
+    ) {
+        if (route == Route.MULTI_MEETING_SYNTHESIS) {
+            return generator.generateSynthesis(scope, question, documents, content);
+        }
+        return generator.generate(scope, question, documents, content);
     }
 
     private void completeGuidance(

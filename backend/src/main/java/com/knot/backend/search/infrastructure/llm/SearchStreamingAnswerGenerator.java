@@ -29,6 +29,26 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
             List<SearchDocumentResult> documents,
             Consumer<String> onDelta
     ) {
+        return generate(scope, question, documents, onDelta, false);
+    }
+
+    @Override
+    public List<Long> generateSynthesis(
+            SearchToolScope scope,
+            String question,
+            List<SearchDocumentResult> documents,
+            Consumer<String> onDelta
+    ) {
+        return generate(scope, question, documents, onDelta, true);
+    }
+
+    private List<Long> generate(
+            SearchToolScope scope,
+            String question,
+            List<SearchDocumentResult> documents,
+            Consumer<String> onDelta,
+            boolean synthesis
+    ) {
         access.validate(scope);
         List<Map<String, Object>> messages = messages(
                 scope,
@@ -47,14 +67,15 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
                     onDelta.accept(text);
                 }
         );
-        llm.stream(
-                scope,
-                messages,
-                text -> {
-                    access.validate(scope);
-                    answer.accept(text);
-                }
-        );
+        Consumer<String> onModelText = text -> {
+            access.validate(scope);
+            answer.accept(text);
+        };
+        if (synthesis) {
+            llm.streamStructuredAnswer(scope, messages, onModelText);
+        } else {
+            llm.stream(scope, messages, onModelText);
+        }
         access.validate(scope);
         return answer.complete(documents);
     }

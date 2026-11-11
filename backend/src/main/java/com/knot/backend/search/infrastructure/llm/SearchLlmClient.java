@@ -228,6 +228,25 @@ public class SearchLlmClient {
             List<Map<String, Object>> messages,
             Consumer<String> onDelta
     ) {
+        stream(scope, messages, body(messages, true), onDelta);
+    }
+
+    public void streamStructuredAnswer(
+            SearchToolScope scope,
+            List<Map<String, Object>> messages,
+            Consumer<String> onDelta
+    ) {
+        Map<String, Object> request = body(messages, true);
+        request.put("response_format", SearchAnswerResponse.responseFormat());
+        stream(scope, messages, request, onDelta);
+    }
+
+    private void stream(
+            SearchToolScope scope,
+            List<Map<String, Object>> messages,
+            Map<String, Object> request,
+            Consumer<String> onDelta
+    ) {
         long started = System.nanoTime();
         long[] firstContentAt = {-1};
         String[] promptTokens = {"unavailable"};
@@ -237,10 +256,7 @@ public class SearchLlmClient {
             http.stream(
                     endpoint(),
                     properties.getApiToken(),
-                    body(
-                            messages,
-                            true
-                    ),
+                    request,
                     scope,
                     event -> {
                         if (event.has("error")) {
