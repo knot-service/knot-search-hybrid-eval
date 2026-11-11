@@ -13,6 +13,7 @@ import java.util.function.Consumer;
 import java.net.URI;
 import lombok.extern.slf4j.Slf4j;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import tools.jackson.databind.JsonNode;
 
 @RequiredArgsConstructor
@@ -21,6 +22,9 @@ public class SearchLlmClient {
 
     private final SearchAgentHttp http;
     private final LlmProperties properties;
+
+    @Value("${knot.search.llm.stream-usage:false}")
+    private boolean streamUsage;
 
     public JsonNode intent(
             SearchToolScope scope,
@@ -238,6 +242,9 @@ public class SearchLlmClient {
     ) {
         Map<String, Object> request = body(messages, true);
         request.put("response_format", SearchGroundedAnswer.responseFormat());
+        if (streamUsage) {
+            request.put("stream_options", Map.of("include_usage", true));
+        }
         stream(scope, messages, request, onDelta);
     }
 

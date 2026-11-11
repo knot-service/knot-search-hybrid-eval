@@ -33,6 +33,7 @@ BODY_SCORE_MARGIN = 1.0
 WEAK_SCORE_GAP = 6.25
 WEAK_PASSAGE_TOKENS = 96
 KOREA = ZoneInfo("Asia/Seoul")
+MAX_EXPANSION_BUDGET = 6144
 
 
 class RetrievalSettings(Frozen):
@@ -613,7 +614,11 @@ async def lifespan(app: FastAPI):
     torch.set_num_threads(4)
     app.state.worker_settings = SPARE_SLOT_SETTINGS
     if os.environ.get("KNOT_HYBRID_EVIDENCE_EXPANSION") == "true":
-        app.state.worker_settings = EVIDENCE_EXPANSION_SETTINGS
+        minimum_budget = EVIDENCE_EXPANSION_SETTINGS.expansion_budget
+        budget = int(os.environ.get("KNOT_SEARCH_HYBRID_EVIDENCE_EXPANSION_BUDGET", minimum_budget))
+        if not minimum_budget <= budget <= MAX_EXPANSION_BUDGET:
+            raise ValueError(f"Hybrid evidence expansion budget must be between {minimum_budget} and {MAX_EXPANSION_BUDGET}")
+        app.state.worker_settings = EVIDENCE_EXPANSION_SETTINGS.model_copy(update={"expansion_budget": budget})
     elif os.environ.get("KNOT_HYBRID_EVIDENCE_SELECTION") == "true":
         app.state.worker_settings = EVIDENCE_SELECTION_SETTINGS
     elif os.environ.get("KNOT_HYBRID_PROTECTED_SUPPORT") == "true":

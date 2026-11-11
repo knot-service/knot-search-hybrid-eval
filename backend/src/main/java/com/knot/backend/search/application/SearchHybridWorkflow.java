@@ -29,6 +29,7 @@ import org.springframework.stereotype.Component;
 public class SearchHybridWorkflow {
     private static final int LIMIT = 10;
     private static final int CONTEXT_TOKENS = 3072;
+    private static final int MAX_EXPANDED_CONTEXT_TOKENS = 6144;
     private static final int SUPPORTING_CONTEXT_TOKENS = 2048;
     private static final int MAX_PASSAGES_PER_KIND = 5;
     private static final int MAX_SUPPORTING_DOCUMENTS_PER_MEETING = 2;
@@ -41,6 +42,7 @@ public class SearchHybridWorkflow {
     private final SearchToolAccess access;
     private final Set<Long> workspaces;
     private final boolean evidenceExpansion;
+    private final int evidenceExpansionBudget;
 
     public SearchHybridWorkflow(
             SearchHybridIndexClient index,
@@ -48,7 +50,8 @@ public class SearchHybridWorkflow {
             SearchDocumentQuery documents,
             SearchToolAccess access,
             @Value("${knot.search.hybrid.workspaces:}") Set<Long> workspaces,
-            @Value("${knot.search.hybrid.evidence-expansion:false}") boolean evidenceExpansion
+            @Value("${knot.search.hybrid.evidence-expansion:false}") boolean evidenceExpansion,
+            @Value("${knot.search.hybrid.evidence-expansion-budget:3072}") int evidenceExpansionBudget
     ) {
         this.index = index;
         this.documentScope = documentScope;
@@ -56,6 +59,11 @@ public class SearchHybridWorkflow {
         this.access = access;
         this.workspaces = Set.copyOf(workspaces);
         this.evidenceExpansion = evidenceExpansion;
+        if (evidenceExpansion && (evidenceExpansionBudget < CONTEXT_TOKENS
+                || evidenceExpansionBudget > MAX_EXPANDED_CONTEXT_TOKENS)) {
+            throw new IllegalArgumentException("Hybrid evidence expansion budget must be between 3072 and 6144");
+        }
+        this.evidenceExpansionBudget = evidenceExpansionBudget;
     }
 
     public boolean enabledFor(long workspaceId) {
@@ -207,7 +215,10 @@ public class SearchHybridWorkflow {
             throw new IllegalStateException("Invalid hybrid context budget");
         }
         var allPassages = Stream.concat(passages.stream(), supportingPassages.stream()).toList();
-        int budget = evidenceExpansion || supportingPassages.isEmpty() ? CONTEXT_TOKENS : SUPPORTING_CONTEXT_TOKENS;
+        int budget = supportingPassages.isEmpty() ? CONTEXT_TOKENS : SUPPORTING_CONTEXT_TOKENS;
+        if (evidenceExpansion) {
+            budget = evidenceExpansionBudget;
+        }
         if (allPassages.stream().anyMatch(p -> p.tokenCount() < 1)
                 || allPassages.stream().mapToLong(Passage::tokenCount).sum() > budget) {
             throw new IllegalStateException("Invalid hybrid context budget");

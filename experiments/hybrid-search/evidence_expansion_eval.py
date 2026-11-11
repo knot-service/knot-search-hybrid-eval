@@ -25,6 +25,8 @@ VARIANTS = {
     "3072 7 slots documents": dict(budget=3072, excerpt_tokens=160, passages_per_kind=7,
                                     supports_per_meeting=3, order="documents"),
     "4096 7 slots 220": dict(budget=4096, excerpt_tokens=220, passages_per_kind=7, supports_per_meeting=3),
+    "5120 7 slots 220": dict(budget=5120, excerpt_tokens=220, passages_per_kind=7, supports_per_meeting=3),
+    "6144 7 slots 220": dict(budget=6144, excerpt_tokens=220, passages_per_kind=7, supports_per_meeting=3),
 }
 
 
