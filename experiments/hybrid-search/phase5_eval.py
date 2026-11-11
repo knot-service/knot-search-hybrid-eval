@@ -81,7 +81,7 @@ def emitted_claims(answer: str) -> list[dict]:
     return claims
 
 
-def summarize() -> None:
+def summarize(context_budget: int = 1024) -> None:
     dataset = read("phase5-fixtures.json")
     before = {row["caseId"]: row for row in read("phase4-spring-report.json")["replay"]}
     after = read("phase5-spring-report.json")
@@ -102,7 +102,7 @@ def summarize() -> None:
         generated = [row for row in rows.values() if row["actualRoute"] != FIND]
         lookup = [row for row in rows.values() if row["actualRoute"] == FIND]
         assert all(not row["passages"] and row["rerankMs"] == 0 and row["contextMs"] == 0 for row in lookup)
-        assert all(sum(passage["tokenCount"] for passage in row["passages"]) <= 1024 for row in generated)
+        assert all(sum(passage["tokenCount"] for passage in row["passages"]) <= context_budget for row in generated)
         data = {
             "replay": len(rows),
             "synthesisBefore": coverage([before[row["caseId"]] for row in syntheses], meetings),
@@ -151,7 +151,12 @@ def summarize() -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--summarize"]:
-        summarize()
+    if sys.argv[1:2] == ["--summarize"]:
+        if sys.argv[2:3] == ["--context-budget"] and len(sys.argv) == 4:
+            summarize(int(sys.argv[3]))
+        elif len(sys.argv) == 2:
+            summarize()
+        else:
+            raise SystemExit("Usage: phase5_eval.py --summarize [--context-budget TOKENS]")
     else:
         prepare()

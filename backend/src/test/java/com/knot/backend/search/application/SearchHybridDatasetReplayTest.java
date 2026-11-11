@@ -590,6 +590,24 @@ class SearchHybridDatasetReplayTest {
     ) {
     }
 
+    @Test
+    @EnabledIfEnvironmentVariable(named = "KNOT_ACCURACY_REPLAY", matches = "true")
+    void replaysRetrievalWithoutGeneration() throws Exception {
+        Path fixture = Path.of(System.getenv("KNOT_PHASE5_FIXTURES"));
+        Dataset dataset = mapper.readValue(fixture.toFile(), Dataset.class);
+        List<Observation> rows = new ArrayList<>();
+        DocumentFixtures documents = new DocumentFixtures(jdbc);
+        for (Workspace workspace : dataset.workspaces()) {
+            rows.addAll(replay(workspace, seed(documents, workspace)));
+        }
+        assertThat(mockingDetails(llm).getInvocations()).isEmpty();
+        Path output = Files.createTempFile(fixture.getParent(), "retrieval-", ".json",
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
+        mapper.writeValue(output.toFile(), rows);
+        Files.move(output, fixture.resolveSibling("retrieval-report.json"),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+    }
+
     private List<Observation> replay(
             Workspace workspace,
             long member
