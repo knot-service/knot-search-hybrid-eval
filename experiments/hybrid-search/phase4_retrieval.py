@@ -43,6 +43,9 @@ class RetrievalSettings(Frozen):
     supporting_excerpt_tokens: int = 0
     supporting_reserve_tokens: int = 0
     supporting_lexical_bonus: float = 0.0
+    supporting_rrf_bonus: float = 0.0
+    supporting_extra_per_meeting: bool = False
+    supporting_shared_slots: bool = False
     supporting_in_questions: bool = False
     keyword_depth: int = DEPTH
     vector_depth: int = DEPTH
@@ -73,6 +76,9 @@ SUPPORTING_DOCUMENT_SETTINGS = SPARE_SLOT_SETTINGS.model_copy(update={
     "supporting_excerpt_tokens": 220,
     "supporting_lexical_bonus": 8.0,
     "supporting_in_questions": True,
+})
+SUPPORTING_SELECTION_SETTINGS = SUPPORTING_DOCUMENT_SETTINGS.model_copy(update={
+    "supporting_extra_per_meeting": True,
 })
 
 
@@ -145,7 +151,8 @@ class Retriever:
     def with_context(self, request: RankRequest, candidates: tuple[Hit, ...],
                      reranker: CrossEncoder, rerank_lock: Lock, tokenizer_lock: Lock,
                      settings: RetrievalSettings = BASELINE, *,
-                     on_selected: Callable[[tuple[Hit, ...]], None] | None = None) -> RankResponse:
+                     on_selected: Callable[[tuple[Hit, ...]], None] | None = None,
+                     on_supporting: Callable[[tuple[Hit, ...], tuple[Hit, ...], int], None] | None = None) -> RankResponse:
         document_ids = tuple(dict.fromkeys(hit.documentId for hit in candidates))
         if request.contextMode == "none" or not candidates:
             return RankResponse(documentIds=document_ids)
@@ -202,20 +209,39 @@ class Retriever:
                 primary_tokens = sum(item.tokenCount for item in contexts)
                 remaining = settings.context_budget - primary_tokens
                 support_budget = remaining + settings.supporting_reserve_tokens
+                primary_hits = tuple(item.hit for item in contexts)
+                extras = ()
                 if support_budget:
-                    primary_hits = tuple(item.hit for item in contexts)
-                    extras = self.supporting_documents(request.question, primary_hits, ranked, relevance, settings)
+                    extras = self.supporting_documents(
+                        request.question, primary_hits, ranked, candidates, relevance, settings,
+                        per_meeting=2 if settings.supporting_shared_slots else 1,
+                    )
                     supports = assemble_worker_context(
                         extras, self.source, self.tokenizer,
                         dict.fromkeys(extras, settings.supporting_excerpt_tokens),
                         budget=support_budget, focus=request.question,
                     )
                     extra_tokens = sum(item.tokenCount for item in supports)
+                    spare = support_budget - extra_tokens
+                    if (settings.supporting_extra_per_meeting and not settings.supporting_shared_slots
+                            and spare and len(supports) < CONTEXT_COUNT):
+                        extras_after = self.supporting_documents(
+                            request.question, (*primary_hits, *(item.hit for item in supports)),
+                            ranked, candidates, relevance, settings,
+                        )[:CONTEXT_COUNT - len(supports)]
+                        supports += assemble_worker_context(
+                            extras_after, self.source, self.tokenizer,
+                            dict.fromkeys(extras_after, settings.supporting_excerpt_tokens),
+                            budget=spare, focus=request.question,
+                        )
+                        extra_tokens = sum(item.tokenCount for item in supports)
                     if extra_tokens > remaining:
                         contexts = assemble_worker_context(
                             selected, self.source, self.tokenizer, limits,
                             budget=settings.context_budget - extra_tokens, focus=focus, extents=extents,
                         )
+                if on_supporting is not None:
+                    on_supporting(primary_hits, extras, support_budget)
         return RankResponse(documentIds=document_ids, passages=self.passages(contexts),
                             supportingPassages=self.passages(supports),
                             rerankMs=rerank_ms, contextMs=ms(started))
@@ -227,7 +253,8 @@ class Retriever:
 
     def supporting_documents(
         self, question: str, primary: tuple[Hit, ...], ranked: tuple[Hit, ...],
-        relevance: dict[Hit, float], settings: RetrievalSettings,
+        candidates: tuple[Hit, ...], relevance: dict[Hit, float], settings: RetrievalSettings,
+        *, per_meeting: int = 1,
     ) -> tuple[Hit, ...]:
         documents = {hit.documentId for hit in primary}
         meetings = {self.source[doc].meetingId for doc in documents}
@@ -235,18 +262,34 @@ class Retriever:
                          and self.source[hit.documentId].meetingId in meetings)
         if not eligible:
             return ()
+        scores = self.supporting_scores(question, primary, eligible, candidates, relevance, settings)
+        chosen: dict[int, list[Hit]] = {}
+        used_documents = set()
+        for hit in sorted(eligible, key=lambda item: sum(scores[item]), reverse=True):
+            if hit.documentId in used_documents:
+                continue
+            by_meeting = chosen.setdefault(self.source[hit.documentId].meetingId, [])
+            if len(by_meeting) < per_meeting:
+                by_meeting.append(hit)
+                used_documents.add(hit.documentId)
+        return tuple(hits[index] for index in range(per_meeting) for hits in chosen.values()
+                     if index < len(hits))[:CONTEXT_COUNT]
+
+    def supporting_scores(
+        self, question: str, primary: tuple[Hit, ...], eligible: tuple[Hit, ...], candidates: tuple[Hit, ...],
+        relevance: dict[Hit, float], settings: RetrievalSettings,
+    ) -> dict[Hit, tuple[float, float, float, float]]:
         existing = [passage_terms(self.source[hit.documentId], hit) for hit in primary]
         lexical = (self.representative_lexical_scores(question, eligible)
                    if settings.supporting_lexical_bonus else {})
+        rrf = {hit: 3 / (3 + index) for index, hit in enumerate(candidates)}
         scores = {}
         for hit in eligible:
             terms = passage_terms(self.source[hit.documentId], hit)
             overlap = max(passage_overlap(terms, terms_in_primary) for terms_in_primary in existing)
-            scores[hit] = relevance[hit] - overlap + settings.supporting_lexical_bonus * lexical.get(hit, 0.0)
-        chosen = {}
-        for hit in sorted(eligible, key=scores.__getitem__, reverse=True):
-            chosen.setdefault(self.source[hit.documentId].meetingId, hit)
-        return tuple(chosen.values())
+            scores[hit] = (relevance[hit], -overlap, settings.supporting_lexical_bonus * lexical.get(hit, 0.0),
+                           settings.supporting_rrf_bonus * rrf[hit])
+        return scores
 
     @staticmethod
     def by_document(ranked: tuple[Hit, ...]) -> tuple[Hit, ...]:
@@ -391,7 +434,9 @@ def prefer_source_text(selected: tuple[Hit, ...], ranked: tuple[Hit, ...],
 async def lifespan(app: FastAPI):
     torch.set_num_threads(4)
     app.state.worker_settings = SPARE_SLOT_SETTINGS
-    if os.environ.get("KNOT_HYBRID_SUPPORTING_CONTEXT") == "true":
+    if os.environ.get("KNOT_HYBRID_SUPPORTING_SELECTION") == "true":
+        app.state.worker_settings = SUPPORTING_SELECTION_SETTINGS
+    elif os.environ.get("KNOT_HYBRID_SUPPORTING_CONTEXT") == "true":
         app.state.worker_settings = SUPPORTING_DOCUMENT_SETTINGS
     elif os.environ.get("KNOT_HYBRID_EXPAND_CONTEXT") == "true":
         app.state.worker_settings = EXPANDED_REPRESENTATIVE_SETTINGS

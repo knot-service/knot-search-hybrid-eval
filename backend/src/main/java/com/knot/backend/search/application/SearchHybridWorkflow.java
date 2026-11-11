@@ -11,6 +11,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -30,6 +31,7 @@ public class SearchHybridWorkflow {
     private static final int CONTEXT_TOKENS = 3072;
     private static final int SUPPORTING_CONTEXT_TOKENS = 2048;
     private static final int MAX_PASSAGES_PER_KIND = 5;
+    private static final int MAX_SUPPORTING_DOCUMENTS_PER_MEETING = 2;
     private static final DateTimeFormatter MEETING_TIME = DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss XXX")
             .withZone(ZoneId.of("Asia/Seoul"));
 
@@ -206,12 +208,14 @@ public class SearchHybridWorkflow {
                 .collect(Collectors.toSet());
         var primaryMeetings = primaryDocuments.stream().map(id -> allowed.get(id).meetingId())
                 .collect(Collectors.toSet());
-        var supportedMeetings = new HashSet<Long>();
+        var supportCounts = new HashMap<Long, Integer>();
+        var seenDocuments = new HashSet<>(primaryDocuments);
         var eligibleSupport = supportingPassages.stream()
-                .filter(p -> allowed.containsKey(p.documentId()) && !primaryDocuments.contains(p.documentId()))
+                .filter(p -> allowed.containsKey(p.documentId()) && seenDocuments.add(p.documentId()))
                 .filter(p -> {
                     long meeting = allowed.get(p.documentId()).meetingId();
-                    return primaryMeetings.contains(meeting) && supportedMeetings.add(meeting);
+                    return primaryMeetings.contains(meeting)
+                            && supportCounts.merge(meeting, 1, Integer::sum) <= MAX_SUPPORTING_DOCUMENTS_PER_MEETING;
                 });
         Map<Long, List<Passage>> byDocument = Stream.concat(passages.stream(), eligibleSupport)
                 .filter(p -> allowed.containsKey(p.documentId()))

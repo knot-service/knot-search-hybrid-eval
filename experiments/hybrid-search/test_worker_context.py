@@ -17,6 +17,27 @@ def character_offsets(text: str, **_options) -> dict:
 
 
 class WorkerContextTest(TestCase):
+    def test_supporting_documents_try_each_meeting_before_a_second_document(self):
+        retriever = Retriever.__new__(Retriever)
+        retriever.source = {
+            i: document(i, "결제 취소 승인 기준").model_copy(update={"meetingId": meeting})
+            for i, meeting in enumerate((1, 2, 1, 1, 2, 3), 1)
+        }
+        first, second, alternative, another, next_meeting, outside = (
+            Hit(documentId=i, field="body", start=0, end=len(doc.body))
+            for i, doc in retriever.source.items()
+        )
+        ranked = (outside, another, alternative, next_meeting, first, second)
+        candidates = (alternative, another, next_meeting, outside, first, second)
+        relevance = dict(zip(ranked, (10.0, 6.0, 5.5, 3.0, 2.0, 1.0), strict=True))
+
+        selected = retriever.supporting_documents(
+            "근거", (first, second), ranked, candidates, relevance,
+            RetrievalSettings(supporting_rrf_bonus=5.0), per_meeting=2,
+        )
+
+        self.assertEqual((alternative, next_meeting, another), selected)
+
     def test_support_uses_the_shared_budget_and_does_not_replace_representatives(self):
         retriever = Retriever.__new__(Retriever)
         retriever.source = {
