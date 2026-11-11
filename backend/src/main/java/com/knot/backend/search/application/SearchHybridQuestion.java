@@ -56,6 +56,17 @@ public record SearchHybridQuestion(
                 raw,
                 Normalizer.Form.NFKC
         );
+        int count = recentCount(question);
+        DateRange dates = dates(question, reference.atZone(KOREA).toLocalDate());
+        return new SearchHybridQuestion(route(question, count), dates.from(), dates.before(), count);
+    }
+
+    static Route classifyRoute(String raw) {
+        String question = Normalizer.normalize(raw, Normalizer.Form.NFKC);
+        return route(question, recentCount(question));
+    }
+
+    private static int recentCount(String question) {
         var recent = RECENT_MEETINGS.matcher(question);
         int count = 0;
         if (recent.find()) {
@@ -68,21 +79,7 @@ public record SearchHybridQuestion(
         if (count == 0 && (question.contains("지난번") || question.contains("가장 최근"))) {
             count = 1;
         }
-        LocalDate day = reference.atZone(KOREA)
-                .toLocalDate();
-        DateRange dates = dates(
-                question,
-                day
-        );
-        return new SearchHybridQuestion(
-                route(
-                        question,
-                        count
-                ),
-                dates.from(),
-                dates.before(),
-                count
-        );
+        return count;
     }
 
     static boolean isDocumentFind(String question) {

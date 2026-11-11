@@ -1,5 +1,7 @@
 package com.knot.backend.search.application;
 
+import com.knot.backend.search.domain.model.SearchExecutionLane;
+
 import com.knot.backend.document.domain.model.Document;
 import com.knot.backend.document.domain.model.DocumentStatus;
 import com.knot.backend.document.domain.repository.DocumentRepository;
@@ -154,11 +156,18 @@ public class SearchAnswerExecutionService {
     }
 
     public Optional<SearchAnswerWorkResult> claim(long answerId) {
+        return claim(answerId, null);
+    }
+
+    public Optional<SearchAnswerWorkResult> claim(long answerId, SearchExecutionLane expectedLane) {
         Optional<SearchAnswerExecution> locked = lockExecution(answerId);
         if (locked.isEmpty()) {
             return Optional.empty();
         }
         SearchAnswerExecution execution = locked.get();
+        if (expectedLane != null && execution.lane() != expectedLane) {
+            return Optional.empty();
+        }
         UUID token = UUID.randomUUID();
         if (!execution.claim(
                 token,
@@ -187,7 +196,8 @@ public class SearchAnswerExecutionService {
                         token,
                         question.getContent(),
                         execution.getCreatedAt(),
-                        execution.isLookupOnly()
+                        execution.isLookupOnly(),
+                        execution.isQuestionOnly()
                 )
         );
     }

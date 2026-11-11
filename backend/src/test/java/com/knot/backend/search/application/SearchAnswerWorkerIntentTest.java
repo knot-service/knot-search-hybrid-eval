@@ -85,7 +85,7 @@ class SearchAnswerWorkerIntentTest {
     @Test
     void queuedLookupNeverFallsThroughToModelWithoutHybridWorkflow() {
         when(executions.claim(5)).thenReturn(Optional.of(new SearchAnswerWorkResult(
-                1, 2, 3, 4, 5, token, "회의 문서 찾아줘", Clock.systemUTC().instant(), true
+                1, 2, 3, 4, 5, token, "회의 문서 찾아줘", Clock.systemUTC().instant(), true, false
         )));
 
         worker.execute(5);

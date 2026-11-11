@@ -37,6 +37,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
+import com.knot.backend.search.domain.model.SearchExecutionLane;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -73,7 +74,7 @@ class SearchAnswerRetryIntegrationTest {
     @MockitoBean
     private SearchGenerationAvailability availability;
     @MockitoBean
-    private SearchLookupLane lookupLane;
+    private SearchWorkerLane workerLane;
     @MockitoBean
     private SearchDocumentRetriever retriever;
     @MockitoBean
@@ -186,13 +187,24 @@ class SearchAnswerRetryIntegrationTest {
     @DisplayName("분리 전 실패 작업을 재시도하면 현재 경로를 다시 저장한다")
     void retryUsesCurrentLookupLaneForExistingAnswer() {
         assertThat(old.lookupOnly()).isFalse();
-        when(lookupLane.usesLookupWorker(workspace, old.question())).thenReturn(true);
+        when(workerLane.classify(workspace, old.question())).thenReturn(SearchExecutionLane.LOOKUP);
 
         retry(UUID.randomUUID());
 
         assertThat(repository.findQueuedAnswerIds(true, 20)).containsExactly(old.answerId());
         assertThat(repository.findQueuedAnswerIds(false, 20)).isEmpty();
         assertThat(executions.claim(old.answerId()).orElseThrow().lookupOnly()).isTrue();
+    }
+
+    @Test
+    void retryReclassifiedAsQuestionCannotBeClaimedBySynthesis() {
+        when(workerLane.classify(workspace, old.question())).thenReturn(SearchExecutionLane.QUESTION);
+
+        retry(UUID.randomUUID());
+
+        assertThat(executions.claim(old.answerId(), SearchExecutionLane.DEFAULT)).isEmpty();
+        assertThat(repository.findQueuedGenerationAnswerIds(true, 20)).containsExactly(old.answerId());
+        assertThat(executions.claim(old.answerId(), SearchExecutionLane.QUESTION).orElseThrow().questionOnly()).isTrue();
     }
 
     @Test

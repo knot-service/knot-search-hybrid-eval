@@ -16,6 +16,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import com.knot.backend.global.config.SearchWorkerProperties;
 import com.knot.backend.search.application.SearchAnswerExecutionService;
 import com.knot.backend.search.application.SearchAnswerWorker;
+import com.knot.backend.search.domain.model.SearchExecutionLane;
 import com.knot.backend.search.domain.repository.SearchRepository;
 import java.time.Clock;
 import java.time.Instant;
@@ -36,6 +37,7 @@ class SearchAnswerSchedulerTest {
     private ThreadPoolTaskExecutor executor;
     private SearchAnswerScheduler scheduler;
     private ThreadPoolTaskExecutor lookupExecutor;
+    private ThreadPoolTaskExecutor synthesisExecutor;
     private SearchWorkerProperties properties;
 
     @BeforeEach
@@ -45,6 +47,7 @@ class SearchAnswerSchedulerTest {
         executions = mock(SearchAnswerExecutionService.class);
         executor = mock(ThreadPoolTaskExecutor.class);
         lookupExecutor = mock(ThreadPoolTaskExecutor.class);
+        synthesisExecutor = mock(ThreadPoolTaskExecutor.class);
         properties = new SearchWorkerProperties();
         scheduler = new SearchAnswerScheduler(
                 repository,
@@ -53,6 +56,7 @@ class SearchAnswerSchedulerTest {
                 properties,
                 executor,
                 lookupExecutor,
+                synthesisExecutor,
                 Clock.fixed(
                         NOW,
                         ZoneOffset.UTC
@@ -119,6 +123,26 @@ class SearchAnswerSchedulerTest {
 
         verify(worker).execute(2L);
         verify(executor).execute(any());
+        verifyNoInteractions(executions);
+    }
+
+    @Test
+    void dispatchQuestionWhenSynthesisIsSaturated() {
+        properties.setLookupConcurrency(1);
+        properties.setSplitGenerationRoutes(true);
+        when(repository.findQueuedGenerationAnswerIds(true, 20)).thenReturn(List.of(2L));
+        when(repository.findQueuedGenerationAnswerIds(false, 20)).thenReturn(List.of(1L));
+        doThrow(new TaskRejectedException("full")).when(synthesisExecutor).execute(any());
+        doAnswer(call -> {
+            Runnable task = call.getArgument(0);
+            task.run();
+            return null;
+        }).when(executor).execute(any());
+
+        scheduler.dispatchQueued();
+
+        verify(worker).execute(2L, SearchExecutionLane.QUESTION);
+        verify(synthesisExecutor).execute(any());
         verifyNoInteractions(executions);
     }
 

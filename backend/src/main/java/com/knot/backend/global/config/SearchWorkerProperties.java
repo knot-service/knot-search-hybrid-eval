@@ -15,6 +15,7 @@ public class SearchWorkerProperties {
     private boolean enabled;
     private int concurrency = 2;
     private int lookupConcurrency;
+    private boolean splitGenerationRoutes;
     private int candidateLimit = 20;
     private Duration pollInterval = Duration.ofSeconds(1);
     private Duration executionLease = Duration.ofSeconds(150);
@@ -35,7 +36,7 @@ public class SearchWorkerProperties {
     }
 
     private void validateConcurrency() {
-        if (concurrency < 1 || concurrency > 16) {
+        if (concurrency < 1 || concurrency > 16 || (splitGenerationRoutes && (concurrency < 2 || lookupConcurrency == 0))) {
             throw new SearchException(SearchErrorCode.INVALID_SEARCH_CONFIGURATION);
         }
     }

@@ -30,7 +30,7 @@ public class SearchAnswerRetryService {
     private final SearchRepository repository;
     private final SearchGenerationAvailability availability;
     private final Clock clock;
-    private final SearchLookupLane lookupLane;
+    private final SearchWorkerLane workerLane;
 
     @Transactional
     public SearchQuestionAcceptedResult acceptRetry(
@@ -87,7 +87,7 @@ public class SearchAnswerRetryService {
                 questionId
         );
         answer.retry();
-        execution.retry(lookupLane.usesLookupWorker(workspaceId, question.getContent()));
+        execution.retry(workerLane.classify(workspaceId, question.getContent()));
         repository.deleteEvidences(answer.getId());
         SearchRequestReceipt receipt = repository.save(
                 SearchRequestReceipt.retry(

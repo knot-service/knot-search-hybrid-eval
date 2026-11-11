@@ -12,12 +12,13 @@ public record SearchAnswerWorkResult(
         UUID token,
         String question,
         Instant createdAt,
-        boolean lookupOnly
+        boolean lookupOnly,
+        boolean questionOnly
 ) {
     public SearchAnswerWorkResult(
             long workspaceId, long memberId, long conversationId, long questionId,
             long answerId, UUID token, String question, Instant createdAt
     ) {
-        this(workspaceId, memberId, conversationId, questionId, answerId, token, question, createdAt, false);
+        this(workspaceId, memberId, conversationId, questionId, answerId, token, question, createdAt, false, false);
     }
 }

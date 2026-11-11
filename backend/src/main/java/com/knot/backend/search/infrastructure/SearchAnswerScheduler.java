@@ -4,6 +4,7 @@ import com.knot.backend.global.logging.ServerErrorLogger;
 import com.knot.backend.global.config.SearchWorkerProperties;
 import com.knot.backend.search.application.SearchAnswerExecutionService;
 import com.knot.backend.search.application.SearchAnswerWorker;
+import com.knot.backend.search.domain.model.SearchExecutionLane;
 import com.knot.backend.search.domain.repository.SearchRepository;
 import java.time.Clock;
 import java.util.List;
@@ -28,6 +29,7 @@ public class SearchAnswerScheduler {
     private final SearchWorkerProperties properties;
     private final ThreadPoolTaskExecutor executor;
     private final ThreadPoolTaskExecutor lookupExecutor;
+    private final ThreadPoolTaskExecutor synthesisExecutor;
     private final Clock clock;
 
     public SearchAnswerScheduler(
@@ -37,6 +39,7 @@ public class SearchAnswerScheduler {
             SearchWorkerProperties properties,
             @Qualifier("searchGenerationExecutor") ThreadPoolTaskExecutor executor,
             @Qualifier("searchLookupExecutor") ThreadPoolTaskExecutor lookupExecutor,
+            @Qualifier("searchSynthesisExecutor") ThreadPoolTaskExecutor synthesisExecutor,
             Clock clock
     ) {
         this.repository = repository;
@@ -45,6 +48,7 @@ public class SearchAnswerScheduler {
         this.properties = properties;
         this.executor = executor;
         this.lookupExecutor = lookupExecutor;
+        this.synthesisExecutor = synthesisExecutor;
         this.clock = clock;
     }
 
@@ -67,14 +71,24 @@ public class SearchAnswerScheduler {
             dispatch(executor, repository.findQueuedAnswerIds(limit));
             return;
         }
-        dispatch(lookupExecutor, repository.findQueuedAnswerIds(true, limit));
-        dispatch(executor, repository.findQueuedAnswerIds(false, limit));
+        if (properties.isSplitGenerationRoutes()) {
+            dispatch(lookupExecutor, repository.findQueuedAnswerIds(true, limit), SearchExecutionLane.LOOKUP);
+            dispatch(executor, repository.findQueuedGenerationAnswerIds(true, limit), SearchExecutionLane.QUESTION);
+            dispatch(synthesisExecutor, repository.findQueuedGenerationAnswerIds(false, limit), SearchExecutionLane.DEFAULT);
+        } else {
+            dispatch(lookupExecutor, repository.findQueuedAnswerIds(true, limit));
+            dispatch(executor, repository.findQueuedAnswerIds(false, limit));
+        }
     }
 
     private void dispatch(ThreadPoolTaskExecutor target, List<Long> candidates) {
+        dispatch(target, candidates, null);
+    }
+
+    private void dispatch(ThreadPoolTaskExecutor target, List<Long> candidates, SearchExecutionLane expectedLane) {
         for (long answerId : candidates) {
             try {
-                target.execute(() -> execute(answerId));
+                target.execute(() -> execute(answerId, expectedLane));
             } catch (TaskRejectedException exception) {
                 return;
             }
@@ -111,9 +125,13 @@ public class SearchAnswerScheduler {
         }
     }
 
-    private void execute(long answerId) {
+    private void execute(long answerId, SearchExecutionLane expectedLane) {
         try {
-            worker.execute(answerId);
+            if (expectedLane == null) {
+                worker.execute(answerId);
+            } else {
+                worker.execute(answerId, expectedLane);
+            }
         } catch (RuntimeException exception) {
             ServerErrorLogger.record(
                     log,

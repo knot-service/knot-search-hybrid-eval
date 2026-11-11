@@ -154,6 +154,11 @@ public class SearchRepositoryAdapter implements SearchRepository {
         return executions.findQueuedByLane(lookupOnly, PageRequest.of(0, limit));
     }
 
+    @Override
+    public List<Long> findQueuedGenerationAnswerIds(boolean questionOnly, int limit) {
+        return executions.findQueuedGenerationByLane(questionOnly, PageRequest.of(0, limit));
+    }
+
     public List<Long> findExpiredAnswerIds(
             Instant now,
             int limit

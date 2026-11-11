@@ -20,7 +20,15 @@ public class SearchWorkerConfig {
     @ConditionalOnProperty(prefix = "knot.search.worker", name = "enabled", havingValue = "true")
     public ThreadPoolTaskExecutor searchGenerationExecutor(SearchWorkerProperties properties) {
         properties.validate();
-        return workerExecutor(properties.getConcurrency(), "search-generation-");
+        return properties.isSplitGenerationRoutes()
+                ? workerExecutor(properties.getConcurrency() - 1, "search-question-")
+                : workerExecutor(properties.getConcurrency(), "search-generation-");
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "knot.search.worker", name = "enabled", havingValue = "true")
+    public ThreadPoolTaskExecutor searchSynthesisExecutor() {
+        return workerExecutor(1, "search-synthesis-");
     }
 
     @Bean

@@ -69,6 +69,8 @@ public interface SearchRepository {
 
     List<Long> findQueuedAnswerIds(boolean lookupOnly, int limit);
 
+    List<Long> findQueuedGenerationAnswerIds(boolean questionOnly, int limit);
+
     List<Long> findExpiredAnswerIds(
             Instant now,
             int limit

@@ -5,6 +5,7 @@ import com.knot.backend.search.application.SearchHybridQuestion.Route;
 import com.knot.backend.search.application.dto.result.SearchAnswerWorkResult;
 import com.knot.backend.search.application.dto.result.SearchDocumentResult;
 import com.knot.backend.search.application.dto.result.SearchRetrievalResult;
+import com.knot.backend.search.domain.model.SearchExecutionLane;
 import com.knot.backend.search.domain.model.SearchIntent;
 import java.time.Clock;
 import java.time.Duration;
@@ -40,8 +41,14 @@ public class SearchAnswerWorker {
 
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public void execute(long answerId) {
+        execute(answerId, null);
+    }
+
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    public void execute(long answerId, SearchExecutionLane expectedLane) {
         Instant workerStartedAt = clock.instant();
-        Optional<SearchAnswerWorkResult> claimed = executions.claim(answerId);
+        Optional<SearchAnswerWorkResult> claimed = expectedLane == null
+                ? executions.claim(answerId) : executions.claim(answerId, expectedLane);
         if (claimed.isEmpty()) {
             return;
         }
@@ -107,10 +114,16 @@ public class SearchAnswerWorker {
         if (work.lookupOnly() && (!hybridEnabled || !SearchHybridQuestion.isDocumentFind(work.question()))) {
             throw new IllegalStateException("Lookup-only execution cannot use the generation path");
         }
+        if (work.questionOnly() && !hybridEnabled) {
+            throw new IllegalStateException("Question-only execution requires hybrid search");
+        }
         if (hybridEnabled) {
             SearchHybridWorkflow.Result result = hybrid.retrieve(scope, work.question());
             if (work.lookupOnly() && result.route() != Route.DOCUMENT_FIND) {
                 throw new IllegalStateException("Lookup-only execution returned a generation route");
+            }
+            if (work.questionOnly() && result.route() != Route.MEETING_QUESTION) {
+                throw new IllegalStateException("Question-only execution returned another route");
             }
             log.info(
                     "Hybrid search workspaceId={} answerId={} route={} questionMs={} retrievalMs={} rerankMs={} contextMs={} candidates={}",
