@@ -404,7 +404,8 @@ class Retriever:
 
     def discover(self, question: str, keyword: tuple[Hit, ...], vector: tuple[Hit, ...],
                  candidates: tuple[Hit, ...], baseline: RankResponse, reranker: CrossEncoder,
-                 rerank_lock: Lock, tokenizer_lock: Lock, settings: RetrievalSettings) -> RankResponse:
+                 rerank_lock: Lock, tokenizer_lock: Lock, settings: RetrievalSettings, *,
+                 same_day: bool = False) -> RankResponse:
         """Rerank additional body candidates after fixing the original selection."""
         if not baseline.passages:
             return baseline
@@ -420,6 +421,11 @@ class Retriever:
         if remaining < 24:
             return baseline
         extra = tuple(hit for hit in fuse(keyword, vector, None) if hit.field == "body" and hit not in existing)
+        if same_day:
+            meeting = self.source[baseline.passages[0].documentId].meetingId
+            covered = {item.hit.documentId for group in contexts for item in group}
+            extra = tuple(hit for hit in extra
+                          if self.source[hit.documentId].meetingId == meeting and hit.documentId not in covered)
         extra = extra[:settings.discovery_rerank_limit]
         if not extra:
             return baseline
@@ -430,7 +436,7 @@ class Retriever:
         with rerank_lock:
             scores = reranker.predict(pairs, batch_size=10, show_progress_bar=False)
         ranked = tuple(hit for hit, _ in sorted(zip(extra, scores, strict=True), key=lambda pair: -pair[1]))
-        window_rerank = settings.discovery_window_rerank and (
+        window_rerank = not same_day and settings.discovery_window_rerank and (
             not settings.discovery_existing_first or remaining < settings.discovery_excerpt_tokens
         )
         if window_rerank:
@@ -451,9 +457,10 @@ class Retriever:
         discovered: list[Context] = []
         added_documents: set[int] = set()
         spare = remaining
+        limit = 1 if same_day else 4
         with tokenizer_lock:
             for hit in ranked:
-                if spare < 24 or len(discovered) == 4:
+                if spare < 24 or len(discovered) == limit:
                     break
                 if hit.documentId in added_documents:
                     continue
@@ -928,9 +935,18 @@ def rank_with(data: RankRequest, state: State, retriever: Retriever, embedding: 
                                            "vector_depth": max(settings.discovery_depth, settings.vector_depth)})
         keyword, vector = retriever.rank_sources(data.question, embedding, allowed, wide, db=db)
         candidates = retriever.fuse_candidates(keyword[:settings.keyword_depth], vector[:settings.vector_depth], settings)
-        baseline = retriever.with_context(data, candidates, state.reranker, state.rerank_lock, state.embed_lock, settings)
+        dates = {datetime.fromisoformat(retriever.source[doc].recordedAt).astimezone(KOREA).date()
+                 for doc in allowed if doc in retriever.source}
+        same_day = data.preferredDocumentId is None and len(dates) == 1
+        reserve = min(settings.discovery_excerpt_tokens, settings.expansion_budget - settings.context_budget)
+        same_day = same_day and reserve >= 24
+        context_settings = settings
+        if same_day:
+            context_settings = settings.model_copy(update={"expansion_budget": settings.expansion_budget - reserve})
+        baseline = retriever.with_context(data, candidates, state.reranker, state.rerank_lock, state.embed_lock,
+                                          context_settings)
         result = retriever.discover(data.question, keyword, vector, candidates, baseline, state.reranker,
-                                    state.rerank_lock, state.embed_lock, settings)
+                                    state.rerank_lock, state.embed_lock, settings, same_day=same_day)
         if settings.meeting_evidence_first:
             with state.embed_lock:
                 return pack_meeting_evidence(data.question, result, retriever, settings)

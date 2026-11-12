@@ -1,4 +1,5 @@
 from threading import Lock
+from types import SimpleNamespace
 from unittest import TestCase
 
 from build_dataset import SourceDoc
@@ -6,7 +7,7 @@ from evidence_expansion import expand_evidence
 from meeting_evidence import reserve_meeting_evidence
 from phase1 import Hit
 from phase3 import CONTEXT_BUDGET, Context, assemble, assemble_worker_context, complete_excerpt_boundaries
-from phase4_retrieval import RankRequest, RankResponse, RetrievalSettings, Retriever, prefer_source_text
+from phase4_retrieval import RankRequest, RankResponse, RetrievalSettings, Retriever, prefer_source_text, rank_with
 from same_document_evidence import extend_same_document, select_short_passages
 
 
@@ -20,6 +21,47 @@ def character_offsets(text: str, **_options) -> dict:
 
 
 class WorkerContextTest(TestCase):
+    def test_same_day_synthesis_reserves_room_for_another_record_from_the_top_meeting(self):
+        source = {
+            doc: document(doc, text).model_copy(update={"meetingId": meeting})
+            for doc, meeting, text in (
+                (1, 10, "기존 대표 근거"),
+                (2, 10, "서로 다른 결정의 근거"),
+                (3, 20, "다른 회의의 기록"),
+            )
+        }
+        hits = tuple(Hit(documentId=doc.id, field="body", start=0, end=len(doc.body))
+                     for doc in source.values())
+
+        class ScopedRetriever(Retriever):
+            def rank_sources(self, *_args, **_kwargs):
+                return hits, ()
+
+            def with_context(self, _data, _hits, _reranker, _rerank_lock, _tokenizer_lock, settings):
+                case.assertEqual(224, settings.expansion_budget)
+                primary = Context(hit=hits[0], tokenCount=settings.expansion_budget)
+                return RankResponse(documentIds=(1,), passages=self.passages((primary,)))
+
+        class Reranker:
+            def predict(self, pairs, **_options):
+                case.assertEqual([("문서별로 확인해줘", "\n서로 다른 결정의 근거")], pairs)
+                return (1,)
+
+        case = self
+        retriever = ScopedRetriever.__new__(ScopedRetriever)
+        retriever.source = source
+        retriever.tokenizer = lambda text, **options: {"input_ids": list(text), **character_offsets(text, **options)}
+        settings = RetrievalSettings(keyword_depth=1, fusion_depth=1, discovery_depth=3,
+                                     context_budget=200, expansion_budget=320, discovery_compact=False)
+        state = SimpleNamespace(worker_settings=settings, reranker=Reranker(), rerank_lock=Lock(), embed_lock=Lock())
+        request = RankRequest(workspaceId=1, question="문서별로 확인해줘", allowedDocumentIds=(1, 2, 3),
+                              contextMode="synthesis")
+
+        result = rank_with(request, state, retriever, "")
+        self.assertEqual([1], [passage.documentId for passage in result.passages])
+        self.assertEqual([2], [passage.documentId for passage in result.discoveryPassages])
+        self.assertLessEqual(sum(p.tokenCount for p in (*result.passages, *result.discoveryPassages)), 320)
+
     def test_discovery_reranks_only_new_chunks_and_keeps_the_representative(self):
         retriever = Retriever.__new__(Retriever)
         retriever.source = {1: document(1, "기존 대표 근거"), 2: document(2, "결제 영수증 기준")}
