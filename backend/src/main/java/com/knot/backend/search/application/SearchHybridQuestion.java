@@ -8,17 +8,21 @@ import java.time.YearMonth;
 import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 public record SearchHybridQuestion(
         Route route,
         List<DateRange> recordedDates,
         int recentMeetings,
-        List<String> inferredComparisonDays
+        List<String> inferredComparisonDays,
+        boolean recentlyEndedMeeting,
+        List<String> meetingTopic
 ) {
     public SearchHybridQuestion {
         recordedDates = List.copyOf(recordedDates);
         inferredComparisonDays = List.copyOf(inferredComparisonDays);
+        meetingTopic = List.copyOf(meetingTopic);
     }
 
     private static final ZoneId KOREA = ZoneId.of("Asia/Seoul");
@@ -58,6 +62,15 @@ public record SearchHybridQuestion(
     private static final Pattern DATE_CONJUNCTION = Pattern.compile("\\s*(?:" + DATE_LIST + ")\\s*");
     private static final Pattern TEMPORAL_MONTH_SUBJECT = Pattern.compile("^이(?:랑|\\s*(?:지나|되|끝나|시작|오기|다가오))");
     private static final Pattern RELATIVE = Pattern.compile("(?:최근|지난)\\s*(\\d{1,2}|한|두|세|네|다섯)\\s*(일|주|개월|달)");
+    private static final Pattern TOPIC_WORD = Pattern.compile("[\\p{L}\\p{N}]+");
+    private static final String MEETING_TOPIC = "((?:[\\p{L}\\p{N}·-]+\\s+){0,6}?)";
+    private static final String MEETING_SUFFIX = "(?=$|[^\\p{L}]|에서|의|에|를|을|은|는)";
+    private static final Pattern JUST_ENDED = Pattern.compile(
+            "(?<![\\p{L}])방금\\s*(?:끝난|종료된|마친)\\s+" + MEETING_TOPIC + "(?:회의(?:록)?|논의)" + MEETING_SUFFIX
+    );
+    private static final Pattern DATED_DISCUSSION = Pattern.compile(
+            "(?:\\d{4}-\\d{2}-\\d{2}|\\d{1,2}월\\s*\\d{1,2}일)\\s+" + MEETING_TOPIC + "논의" + MEETING_SUFFIX
+    );
 
     public enum Route {
         DOCUMENT_FIND,
@@ -81,8 +94,32 @@ public record SearchHybridQuestion(
                 .allMatch(range -> range.from().plus(1, ChronoUnit.DAYS).equals(range.before()))
                 ? days.stream().map(range -> range.from().atZone(KOREA).toLocalDate().toString()).distinct().toList()
                 : List.of();
-        return new SearchHybridQuestion(inferred ? Route.MULTI_MEETING_SYNTHESIS : initialRoute,
-                days, count, comparisonDays);
+        Route route = inferred ? Route.MULTI_MEETING_SYNTHESIS : initialRoute;
+        var ended = JUST_ENDED.matcher(question);
+        boolean recentlyEnded = route != Route.MULTI_MEETING_SYNTHESIS && ended.find();
+        List<String> topic = List.of();
+        if (recentlyEnded) {
+            topic = topicWords(ended.group(1));
+        } else if (route == Route.MEETING_QUESTION && days.size() == 1
+                && days.getFirst().from().plus(1, ChronoUnit.DAYS).equals(days.getFirst().before())) {
+            var named = DATED_DISCUSSION.matcher(question);
+            if (named.find()) {
+                var words = topicWords(named.group(1));
+                if (words.size() >= 2) {
+                    topic = words;
+                }
+            }
+        }
+        return new SearchHybridQuestion(route, days, count, comparisonDays, recentlyEnded, topic);
+    }
+
+    boolean matchesMeetingTopic(String title, String topic) {
+        return topicWords(title).containsAll(meetingTopic) || topicWords(topic).containsAll(meetingTopic);
+    }
+
+    private static List<String> topicWords(String text) {
+        String normalized = Normalizer.normalize(text, Normalizer.Form.NFKC).toLowerCase(Locale.ROOT);
+        return TOPIC_WORD.matcher(normalized).results().map(match -> match.group()).distinct().toList();
     }
 
     static Route classifyRoute(String raw) {

@@ -93,6 +93,9 @@ public class SearchHybridWorkflow {
         long questionNanos = System.nanoTime() - started;
         long retrievalStarted = System.nanoTime();
         Long preferredDocumentId = SearchHybridQuestion.explicitDocumentId(rawQuestion);
+        if (preferredDocumentId == null) {
+            eligible = scopeToMeetingTopic(question, eligible);
+        }
         if (eligible.isEmpty() || (preferredDocumentId != null
                 && eligible.stream().noneMatch(doc -> doc.id() == preferredDocumentId))) {
             return new Result(
@@ -154,6 +157,28 @@ public class SearchHybridWorkflow {
                 ranking.rerankMs(),
                 ranking.contextMs()
         );
+    }
+
+    static List<EligibleDocument> scopeToMeetingTopic(SearchHybridQuestion question, List<EligibleDocument> eligible) {
+        if (!question.meetingTopic().isEmpty()) {
+            var matches = eligible.stream()
+                    .filter(doc -> question.matchesMeetingTopic(doc.title(), doc.topic()))
+                    .toList();
+            if (question.recentlyEndedMeeting()) {
+                eligible = matches;
+            } else if (!matches.isEmpty()) {
+                var matchingMeetings = matches.stream().map(EligibleDocument::meetingId).collect(Collectors.toSet());
+                var matchingIds = matches.stream().map(EligibleDocument::id).collect(Collectors.toSet());
+                eligible = eligible.stream()
+                        .filter(doc -> !matchingMeetings.contains(doc.meetingId()) || matchingIds.contains(doc.id()))
+                        .toList();
+            }
+        }
+        if (question.recentlyEndedMeeting() && question.route() == Route.MEETING_QUESTION
+                && eligible.stream().map(EligibleDocument::meetingId).distinct().limit(2).count() > 1) {
+            return List.of();
+        }
+        return eligible;
     }
 
     private String contextMode(Route route) {

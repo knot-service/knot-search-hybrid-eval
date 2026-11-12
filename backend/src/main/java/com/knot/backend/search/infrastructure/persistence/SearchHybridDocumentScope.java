@@ -3,6 +3,7 @@ package com.knot.backend.search.infrastructure.persistence;
 import com.knot.backend.search.application.SearchHybridQuestion;
 import com.knot.backend.search.application.SearchToolScope;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -13,6 +14,7 @@ import org.springframework.stereotype.Repository;
 @Repository
 @RequiredArgsConstructor
 public class SearchHybridDocumentScope {
+    private static final Duration RECENTLY_ENDED_WINDOW = Duration.ofHours(1);
 
     private final JdbcClient jdbc;
 
@@ -21,11 +23,12 @@ public class SearchHybridDocumentScope {
             SearchHybridQuestion question
     ) {
         return jdbc.sql("""
-                SELECT d.id, r.id AS meeting_id, r.started_at
+                SELECT d.id, r.id AS meeting_id, r.started_at, d.title, COALESCE(d.topic, '') AS topic
                 FROM documents d JOIN recording_sessions r ON r.id = d.recording_session_id
                 WHERE d.workspace_id = :workspace AND r.workspace_id = :workspace
                   AND d.status IN ('DRAFT', 'ARCHIVED') AND d.created_at <= :cutoff
                   AND r.started_at <= :cutoff
+                  AND (NOT :recentlyEnded OR r.ended_at BETWEEN :recentCutoff AND :cutoff)
                   AND (CAST(:dates AS tstzmultirange) IS NULL OR r.started_at <@ CAST(:dates AS tstzmultirange))
                 ORDER BY r.started_at DESC, d.id DESC
                 """)
@@ -37,6 +40,8 @@ public class SearchHybridDocumentScope {
                         "cutoff",
                         Timestamp.from(scope.startedAt())
                 )
+                .param("recentlyEnded", question.recentlyEndedMeeting())
+                .param("recentCutoff", Timestamp.from(scope.startedAt().minus(RECENTLY_ENDED_WINDOW)))
                 .param(
                         "dates",
                         recordedDates(question)
@@ -48,8 +53,9 @@ public class SearchHybridDocumentScope {
                         ) -> new EligibleDocument(
                                 row.getLong("id"),
                                 row.getLong("meeting_id"),
-                                row.getTimestamp("started_at")
-                                        .toInstant()
+                                        row.getTimestamp("started_at").toInstant(),
+                                        row.getString("title"),
+                                        row.getString("topic")
                         )
                 )
                 .list();
@@ -67,7 +73,9 @@ public class SearchHybridDocumentScope {
     public record EligibleDocument(
             long id,
             long meetingId,
-            Instant recordedAt
+            Instant recordedAt,
+            String title,
+            String topic
     ) {
     }
 }

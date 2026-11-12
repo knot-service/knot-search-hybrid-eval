@@ -83,6 +83,34 @@ class SearchHybridQuestionTest {
                 .containsExactly(range("2026-05-31T15:00:00Z", "2026-06-30T15:00:00Z"));
     }
 
+    @Test
+    void recognizesRecentlyEndedMeetingWithoutChangingLookupRoute() {
+        var question = SearchHybridQuestion.parse("방금 끝난 정기 결제 리허설 회의에서 뭘 결정했어?", REFERENCE);
+        assertThat(question.recentlyEndedMeeting()).isTrue();
+        assertThat(question.meetingTopic()).containsExactly("정기", "결제", "리허설");
+
+        var lookup = SearchHybridQuestion.parse("방금 끝난 회의 찾아줘", REFERENCE);
+        assertThat(lookup.route()).isEqualTo(Route.DOCUMENT_FIND);
+        assertThat(lookup.recentlyEndedMeeting()).isTrue();
+        assertThat(lookup.meetingTopic()).isEmpty();
+
+        var comparison = SearchHybridQuestion.parse("방금 끝난 배포 회의와 지난 회의의 차이를 비교해 줘", REFERENCE);
+        assertThat(comparison.route()).isEqualTo(Route.MULTI_MEETING_SYNTHESIS);
+        assertThat(comparison.recentlyEndedMeeting()).isFalse();
+    }
+
+    @Test
+    void matchesTheDatedDiscussionTopicInDocumentMetadata() {
+        var question = SearchHybridQuestion.parse(
+                "잠깐, 10월 27일 유입 분석 논의에서 홍보 링크에 UTM을 붙이기로 했어?", REFERENCE
+        );
+        assertThat(question.meetingTopic()).containsExactly("유입", "분석");
+        assertThat(question.matchesMeetingTopic("유입 소스 추적 및 분석 지표 설정", "")).isTrue();
+        assertThat(question.matchesMeetingTopic("홍보 글 작성 및 이벤트 기획", "홍보")).isFalse();
+        assertThat(SearchHybridQuestion.parse("10월 27일 회의에서 무엇을 결정했어?", REFERENCE).meetingTopic())
+                .isEmpty();
+    }
+
     private static DateRange range(String from, String before) {
         return new DateRange(Instant.parse(from), Instant.parse(before));
     }
