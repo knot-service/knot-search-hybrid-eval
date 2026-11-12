@@ -17,7 +17,7 @@ interface SearchEvidenceReadJpaRepository extends Repository<SearchEvidence, Sea
             join SearchConversation c on c.id = m.conversationId
             join Document d on d.id = e.id.documentId and d.workspaceId = c.workspaceId
             where c.workspaceId = :workspaceId and c.memberId = :memberId and c.id = :conversationId
-                and m.role = 'ASSISTANT' and m.id in :answerIds and e.rank <= 3
+                and m.role = 'ASSISTANT' and m.id in :answerIds
             order by m.id, e.rank
             """)
     List<SearchEvidenceRow> findForMessages(

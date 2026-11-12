@@ -437,7 +437,7 @@ describe("SearchConversation", () => {
     expect(screen.getByText(secondParagraph).tagName).toBe("P");
   });
 
-  it("검증된 출처를 답변 아래에 별도 문단으로 보여준다", async () => {
+  it("이전 답변의 내부 출처 ID도 제목으로 바꾸고 원문 인용은 별도 문단에 보존한다", async () => {
     mockServer.use(
       http.get(MESSAGES_PATH, () =>
         HttpResponse.json({
@@ -447,7 +447,7 @@ describe("SearchConversation", () => {
               ? {
                   ...message,
                   content:
-                    "댓글이 달린 게시글은 유지해요. 문서 #101에는 “댓글이 있는 게시글은 유지한다.”라고 기록돼 있어요.",
+                    "[E101Q1]에 따르면 댓글이 달린 게시글은 유지해요. 문서 #101에는 “댓글이 있는 게시글은 유지한다.”라고 기록돼 있어요.",
                 }
               : message,
           ),
@@ -457,11 +457,15 @@ describe("SearchConversation", () => {
 
     renderConversation();
 
-    const conclusion = await screen.findByText("댓글이 달린 게시글은 유지해요.");
-    const reference = screen.getByText(/^「회원 탈퇴 정책」에는/);
+    const conclusion = await screen.findByText(
+      "「회원 탈퇴 정책」에 따르면 댓글이 달린 게시글은 유지해요.",
+    );
+    const reference = screen.getByText(
+      "「회원 탈퇴 정책」에는 “댓글이 있는 게시글은 유지한다.”라고 기록돼 있어요.",
+    );
     expect(conclusion.nextElementSibling).toBe(reference);
     expect(reference.tagName).toBe("P");
-    expect(screen.queryByText(/문서 #101/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/E101Q1|문서 #101/)).not.toBeInTheDocument();
   });
 
   it("근거가 있는 답변 아래에만 '기록 N개에서 찾았어요' 버튼을 둔다 (SEARCH-R2)", async () => {

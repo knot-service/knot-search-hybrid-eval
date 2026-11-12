@@ -1,10 +1,13 @@
 package com.knot.backend.search.infrastructure.llm;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import tools.jackson.databind.ObjectMapper;
 
@@ -14,6 +17,9 @@ record SearchGroundedAnswer(
 ) {
     private static final int MAX_CLAIMS = 6;
     private static final int MAX_SOURCES_PER_CLAIM = 2;
+    private static final Pattern INTERNAL_SOURCE_ID = Pattern.compile(
+            "(?<![A-Za-z0-9_])(?:\\[|`)?(E\\d+)(?:Q\\d+)?(?:\\]|`)?(?![A-Za-z0-9_]|-[A-Za-z0-9])"
+    );
 
     static Map<String, Object> responseFormat() {
         var source = object(
@@ -151,6 +157,7 @@ record SearchGroundedAnswer(
             return null;
         }
         Set<Source> verified = new LinkedHashSet<>();
+        Map<String, String> titles = new HashMap<>();
         for (ModelSource source : claim.sources()) {
             if (source == null || source.evidenceId() == null || source.quoteId() == null) {
                 return null;
@@ -161,8 +168,13 @@ record SearchGroundedAnswer(
                 return null;
             }
             verified.add(new Source(document.documentId(), quote));
+            if (document.title() != null && !document.title().isBlank()) {
+                titles.put(source.evidenceId(), "「" + document.title().strip().replaceAll("\\s+", " ") + "」");
+            }
         }
-        return new Claim(claim.text(), List.copyOf(verified));
+        String text = INTERNAL_SOURCE_ID.matcher(claim.text()).replaceAll(reference ->
+                Matcher.quoteReplacement(titles.getOrDefault(reference.group(1), "회의 기록")));
+        return new Claim(text, List.copyOf(verified));
     }
 
     record ModelClaim(String text, List<ModelSource> sources) {

@@ -69,7 +69,8 @@ class SearchGroundedAnswerTest {
                 new SearchDocumentResult(1, "제안", "탐색", "", List.of("날짜별 탐색 구조가 제안되었다.")),
                 new SearchDocumentResult(2, "시각화", "탐색", "", List.of("탐색의 시각화 방식은 아직 정해지지 않았다.")),
                 new SearchDocumentResult(3, "할 일", "탐색", "", List.of("할 일 화면의 구체적 구현 방식은 미정이다.")),
-                new SearchDocumentResult(4, "홈", "탐색", "", List.of("홈 화면의 독립 뷰 제공 여부는 정해지지 않았다."))
+                new SearchDocumentResult(408, "홈 & ADR $1", "탐색", "",
+                        List.of("홈 화면의 독립 뷰 제공 여부는 정해지지 않았다."))
         );
         var result = SearchGroundedAnswer.verify(
                 """
@@ -78,19 +79,19 @@ class SearchGroundedAnswerTest {
                             {"evidenceId":"E1","quoteId":"E1Q1"}]},
                           {"text":"탐색의 시각화 방식은 미정이었다.","sources":[
                             {"evidenceId":"E2","quoteId":"E2Q1"}]},
-                          {"text":"할 일 화면의 구현 방식과 독립 뷰 제공 여부는 미정이었다.","sources":[
-                            {"evidenceId":"E3","quoteId":"E3Q1"},{"evidenceId":"E4","quoteId":"E4Q1"}]}
+                          {"text":"E3에서는 구현이 미정이었다. [E408Q1]에서도 독립 뷰는 미정이었다.","sources":[
+                            {"evidenceId":"E3","quoteId":"E3Q1"},{"evidenceId":"E408","quoteId":"E408Q1"}]}
                         ]}
                         """,
                 SearchGroundedEvidence.index(docs),
                 mapper
         );
         assertThat(result.claims()).hasSize(3);
-        assertThat(result.documentIds()).containsExactly(1L, 2L, 3L, 4L);
+        assertThat(result.documentIds()).containsExactly(1L, 2L, 3L, 408L);
         assertThat(result.render()).contains(
-                "할 일 화면의 구현 방식과 독립 뷰 제공 여부는 미정이었다.",
-                "문서 #4에는 “홈 화면의 독립 뷰 제공 여부는 정해지지 않았다.”"
-        );
+                "「할 일」에서는 구현이 미정이었다. 「홈 & ADR $1」에서도 독립 뷰는 미정이었다.",
+                "문서 #408에는 “홈 화면의 독립 뷰 제공 여부는 정해지지 않았다.”"
+        ).doesNotContain("E3", "E408");
         assertThat(result.incomplete()).isFalse();
     }
 

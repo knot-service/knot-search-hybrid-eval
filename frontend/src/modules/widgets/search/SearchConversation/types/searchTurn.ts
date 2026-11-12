@@ -10,7 +10,7 @@ export interface SearchTurnAnswer {
   /** 생성 중인 답변은 `STREAMING`이에요 */
   status: SearchMessage["status"];
 
-  /** 근거 문서. 최대 3개, 관련도 순이에요 */
+  /** 답변에 저장된 근거 문서. rank 오름차순이에요 */
   evidences: SearchMessage["evidences"];
 }
 

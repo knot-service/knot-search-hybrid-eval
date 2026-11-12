@@ -9,7 +9,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-record SearchGroundedEvidence(long documentId, String content, Map<String, String> quotes) {
+record SearchGroundedEvidence(long documentId, String title, String content, Map<String, String> quotes) {
 
     private static final int MAX_QUOTE_LENGTH = 300;
 
@@ -44,7 +44,8 @@ record SearchGroundedEvidence(long documentId, String content, Map<String, Strin
             }
             content.add("");
         }
-        return new SearchGroundedEvidence(document.documentId(), String.join("\n", content), Map.copyOf(quotes));
+        return new SearchGroundedEvidence(document.documentId(), document.title(), String.join("\n", content),
+                Map.copyOf(quotes));
     }
 
     private static List<String> sentences(String line) {

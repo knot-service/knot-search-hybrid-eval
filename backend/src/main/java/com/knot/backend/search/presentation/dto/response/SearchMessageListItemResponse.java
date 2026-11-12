@@ -16,7 +16,7 @@ public record SearchMessageListItemResponse(
         @Schema(description = "저장된 전체 본문. STREAMING은 빈 문자열 허용", requiredMode = REQUIRED) String content,
         @Schema(requiredMode = REQUIRED) SearchMessageStatus status,
         @Schema(requiredMode = REQUIRED) Instant createdAt,
-        @Schema(description = "Document 카드. rank 오름차순 최대 3개, USER는 빈 배열", requiredMode = REQUIRED) List<SearchEvidenceItemResponse> evidences
+        @Schema(description = "저장된 문서 카드. rank 오름차순, USER는 빈 배열", requiredMode = REQUIRED) List<SearchEvidenceItemResponse> evidences
 ) {
 
     public static SearchMessageListItemResponse from(SearchMessageListItemResult result) {

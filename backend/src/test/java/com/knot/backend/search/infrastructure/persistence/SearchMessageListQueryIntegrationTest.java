@@ -70,7 +70,7 @@ class SearchMessageListQueryIntegrationTest {
     }
 
     @Test
-    @DisplayName("같은 페이지의 여러 답변에 각각 상위 세 카드를 반환한다")
+    @DisplayName("같은 페이지의 여러 답변에 저장된 인용을 답변별로 반환한다")
     void findEvidences_success_multipleAnswersInOnePage() {
         search.saveMessage(
                 conversationId,
@@ -125,19 +125,23 @@ class SearchMessageListQueryIntegrationTest {
                 .containsExactly(
                         1,
                         2,
-                        3
+                        3,
+                        4,
+                        5
                 );
         assertThat(result.get(second)).extracting(SearchEvidenceItemResult::rank)
                 .containsExactly(
                         1,
                         2,
-                        3
+                        3,
+                        4,
+                        5
                 );
     }
 
     @Test
-    @DisplayName("실제 근거는 모두 보존하고 각 답변의 관련도 상위 세 카드만 조회한다")
-    void findEvidences_success_threeCardsPerAnswer() {
+    @DisplayName("각 답변에 저장된 모든 인용 카드를 순서대로 조회한다")
+    void findEvidences_success_allCitedCardsPerAnswer() {
         long firstAnswer = messages.messageId(
                 conversationId,
                 2
@@ -186,13 +190,17 @@ class SearchMessageListQueryIntegrationTest {
                 .containsExactly(
                         1,
                         2,
-                        3
+                        3,
+                        4,
+                        5
                 );
         assertThat(second.get(secondAnswer)).extracting(SearchEvidenceItemResult::rank)
                 .containsExactly(
                         1,
                         2,
-                        3
+                        3,
+                        4,
+                        5
                 );
         assertThat(
                 jdbc.sql("SELECT count(*) FROM search_evidences WHERE message_id IN (:ids)")

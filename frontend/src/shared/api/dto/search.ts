@@ -237,7 +237,7 @@ export interface SearchStreamEvidenceRaw {
 export class SearchStreamEvidenceDto {
   /** 근거가 붙는 답변 메시지 ID */
   answerMessageId: number;
-  /** 근거 문서. 최대 3개, 관련도 순(rank 오름차순) */
+  /** 답변에 저장된 근거 문서. rank 오름차순 */
   items: SearchEvidenceDto[];
 
   constructor(raw: SearchStreamEvidenceRaw) {
@@ -365,7 +365,7 @@ export class SearchMessageDto {
   status: SearchMessageStatus;
   /** 만든 시각(ISO 8601) */
   createdAt: string;
-  /** 답변의 근거 문서. 최대 3개, 관련도 순(rank 오름차순). 질문(USER)은 빈 배열 */
+  /** 답변에 저장된 근거 문서. rank 오름차순. 질문(USER)은 빈 배열 */
   evidences: SearchEvidenceDto[];
 
   constructor(raw: SearchMessageRaw) {

@@ -17,19 +17,27 @@ interface SearchTurnProps {
 }
 
 function displayAnswerParagraphs({ content, evidences }: SearchTurnAnswer) {
+  const sourceTitle = (documentId: string) => {
+    const evidence = evidences.find(
+      (item) => item.documentId === Number(documentId),
+    );
+    const title = evidence?.title.trim().replace(/\s+/g, " ");
+    return title ? `「${title}」` : "회의 기록";
+  };
   const separatedCitations = content.replace(
     /^(.+?) (문서 #\d+에는 “)/gm,
-    "$1\n\n$2",
+    (_paragraph, prose: string, citation: string) => {
+      // 이전에 저장된 답변의 모델 표기만 바꾸고 원문 인용은 보존해요.
+      const text = prose.replace(
+        /(?<![A-Za-z0-9_])(?:\[|`)?E(\d+)(?:Q\d+)?(?:\]|`)?(?![A-Za-z0-9_]|-[A-Za-z0-9])/g,
+        (_reference, documentId: string) => sourceTitle(documentId),
+      );
+      return `${text}\n\n${citation}`;
+    },
   );
   const displayText = separatedCitations.replace(
     /문서 #(\d+)(?=에는 “| 근거:)/g,
-    (_reference, documentId: string) => {
-      const evidence = evidences.find(
-        (item) => item.documentId === Number(documentId),
-      );
-      const title = evidence?.title.trim().replace(/\s+/g, " ");
-      return title ? `「${title}」` : "회의 기록";
-    },
+    (_reference, documentId: string) => sourceTitle(documentId),
   );
   return displayText.split("\n").filter((line) => line.trim() !== "");
 }

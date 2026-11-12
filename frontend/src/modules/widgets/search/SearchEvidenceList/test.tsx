@@ -1,10 +1,12 @@
 import { GetSearchMessagesResponseDto } from "@api/dto/search";
 import { searchMessagesResponse } from "@api/mock/responses/search";
+import { mockServer } from "@api/mock/server";
 import { ThemeProvider } from "@emotion/react";
 import { theme } from "@provider/themeProvider";
 import { getRouterPath, PATH_ROUTE } from "@routes/PATH_ROUTE";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor, within } from "@testing-library/react";
+import { http, HttpResponse } from "msw";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { describe, expect, it } from "vitest";
 
@@ -98,6 +100,46 @@ describe("SearchEvidenceList", () => {
         }),
       );
     });
+  });
+
+  it("네 번째 인용 문서도 제목과 링크가 있는 카드로 보여준다", async () => {
+    const fourth = {
+      documentId: 408,
+      title: "레거시 독스 파일 구조 변경 및 백업",
+      topic: "ADR",
+      rank: 4,
+    };
+    mockServer.use(
+      http.get(
+        "*/api/v1/workspaces/:workspaceId/search/conversations/:conversationId/messages",
+        () =>
+          HttpResponse.json({
+            ...searchMessagesResponse,
+            items: searchMessagesResponse.items.map((message) =>
+              message.id === answerWithThreeEvidences.id
+                ? { ...message, evidences: [...message.evidences, fourth] }
+                : message,
+            ),
+          }),
+      ),
+    );
+
+    await renderEvidenceList(
+      `${CONVERSATION_PATH}?messageId=${answerWithThreeEvidences.id}`,
+    );
+
+    const panel = screen.getByRole("region", { name: "찾은 기록" });
+    const items = within(panel).getAllByRole("listitem");
+    expect(items).toHaveLength(4);
+    expect(
+      within(items[3]).getByRole("link", { name: /레거시 독스 파일 구조 변경 및 백업/ }),
+    ).toHaveAttribute(
+      "href",
+      getRouterPath({
+        routeKey: "DOCUMENT",
+        params: { workspaceId: WORKSPACE_ID, documentId: "408" },
+      }),
+    );
   });
 
   it("펼친 답변이 없으면 패널을 그리지 않는다 (SEARCH-R2)", async () => {
