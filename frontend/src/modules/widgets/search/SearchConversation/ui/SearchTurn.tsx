@@ -4,13 +4,34 @@ import ChatBubble from "@primitives/ui/ChatBubble";
 import EvidenceButton from "@primitives/ui/EvidenceButton";
 import InlineError from "@primitives/ui/InlineError";
 
-import type { SearchTurn as SearchTurnData } from "../types/searchTurn";
+import type {
+  SearchTurn as SearchTurnData,
+  SearchTurnAnswer,
+} from "../types/searchTurn";
 
 interface SearchTurnProps {
   turn: SearchTurnData;
 
   /** 실패한 답변의 `다시 시도`를 눌렀을 때 실행할 동작 */
   onRetryAnswer: () => void;
+}
+
+function displayAnswerParagraphs({ content, evidences }: SearchTurnAnswer) {
+  const separatedCitations = content.replace(
+    /^(.+?) (문서 #\d+에는 “)/gm,
+    "$1\n\n$2",
+  );
+  const displayText = separatedCitations.replace(
+    /문서 #(\d+)(?=에는 “| 근거:)/g,
+    (_reference, documentId: string) => {
+      const evidence = evidences.find(
+        (item) => item.documentId === Number(documentId),
+      );
+      const title = evidence?.title.trim().replace(/\s+/g, " ");
+      return title ? `「${title}」` : "회의 기록";
+    },
+  );
+  return displayText.split("\n").filter((line) => line.trim() !== "");
 }
 
 /**
@@ -27,8 +48,7 @@ export default function SearchTurn({ turn, onRetryAnswer }: SearchTurnProps) {
 
   // TODO: BE가 답변 content를 마크다운으로 줘요
   // 마크다운 렌더러로 바꾸면 줄 단위 split과 Paragraph는 빠져요.
-  const paragraphs =
-    answer?.content.split("\n").filter((line) => line.trim() !== "") ?? [];
+  const paragraphs = answer ? displayAnswerParagraphs(answer) : [];
   const evidenceCount = answer?.evidences.length ?? 0;
   const isSearching = answer?.status === "STREAMING" && paragraphs.length === 0;
 

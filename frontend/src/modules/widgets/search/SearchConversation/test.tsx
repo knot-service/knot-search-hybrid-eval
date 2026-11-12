@@ -437,6 +437,33 @@ describe("SearchConversation", () => {
     expect(screen.getByText(secondParagraph).tagName).toBe("P");
   });
 
+  it("검증된 출처를 답변 아래에 별도 문단으로 보여준다", async () => {
+    mockServer.use(
+      http.get(MESSAGES_PATH, () =>
+        HttpResponse.json({
+          ...searchMessagesResponse,
+          items: searchMessagesResponse.items.map((message) =>
+            message.id === 2
+              ? {
+                  ...message,
+                  content:
+                    "댓글이 달린 게시글은 유지해요. 문서 #101에는 “댓글이 있는 게시글은 유지한다.”라고 기록돼 있어요.",
+                }
+              : message,
+          ),
+        }),
+      ),
+    );
+
+    renderConversation();
+
+    const conclusion = await screen.findByText("댓글이 달린 게시글은 유지해요.");
+    const reference = screen.getByText(/^「회원 탈퇴 정책」에는/);
+    expect(conclusion.nextElementSibling).toBe(reference);
+    expect(reference.tagName).toBe("P");
+    expect(screen.queryByText(/문서 #101/)).not.toBeInTheDocument();
+  });
+
   it("근거가 있는 답변 아래에만 '기록 N개에서 찾았어요' 버튼을 둔다 (SEARCH-R2)", async () => {
     renderConversation();
 
