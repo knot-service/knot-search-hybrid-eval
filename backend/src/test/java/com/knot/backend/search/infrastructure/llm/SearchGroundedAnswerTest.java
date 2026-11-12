@@ -52,12 +52,14 @@ class SearchGroundedAnswerTest {
                 1L,
                 2L
         );
-        assertThat(result.render()).contains(
-                "문서 #1 근거",
-                "문서 #2 근거",
-                "일부 내용"
-        )
-                .doesNotContain("금요일");
+        assertThat(result.render())
+                .startsWith("처음 제안했고 다음 주 전환에 합의했다.")
+                .contains(
+                        "문서 #1에는 “자동 배포 전환을 제안했다.”라고 기록돼 있어요.",
+                        "문서 #2에는 “다음 주에 전환하기로 합의했다.”라고 기록돼 있어요.",
+                        "\n\n일부 내용"
+                )
+                .doesNotContain("- ", "근거:", "금요일");
     }
 
     @Test

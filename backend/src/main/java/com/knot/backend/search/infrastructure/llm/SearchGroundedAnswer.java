@@ -230,23 +230,12 @@ record SearchGroundedAnswer(
             List<Source> sources
     ) {
         String render() {
-            String notes = sources.stream()
-                    .map(
-                            source -> "  - 문서 #" + source.evidenceId()
-                                    .substring(1) + " 근거: "
-                                    + source.quote()
-                                            .strip()
-                                            .replaceAll(
-                                                    "\\R",
-                                                    " "
-                                            )
-                    )
-                    .collect(Collectors.joining("\n"));
-            return "- " + text.strip()
-                    .replaceAll(
-                            "\\R",
-                            " "
-                    ) + "\n" + notes;
+            String references = sources.stream()
+                    .map(Source::render)
+                    .collect(Collectors.joining(" "));
+            String paragraph = text.strip()
+                    .replaceAll("\\R+", " ");
+            return paragraph + " " + references;
         }
     }
 
@@ -254,6 +243,11 @@ record SearchGroundedAnswer(
             String evidenceId,
             String quote
     ) {
+        String render() {
+            String documentNumber = evidenceId.substring(1);
+            String excerpt = quote.replaceAll("\\R", " ");
+            return "문서 #" + documentNumber + "에는 “" + excerpt + "”라고 기록돼 있어요.";
+        }
     }
 
     record Verified(
@@ -267,7 +261,7 @@ record SearchGroundedAnswer(
             }
             String answer = claims.stream()
                     .map(Claim::render)
-                    .collect(Collectors.joining("\n"));
+                    .collect(Collectors.joining("\n\n"));
             if (incomplete) {
                 return answer + "\n\n일부 내용은 찾은 회의 문서에서 확인하지 못했습니다.";
             }

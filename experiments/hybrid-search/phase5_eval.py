@@ -19,6 +19,7 @@ FIND = "DOCUMENT_FIND"
 QUESTION = "MEETING_QUESTION"
 SYNTHESIS = "MULTI_MEETING_SYNTHESIS"
 SOURCE = re.compile(r"^  - 문서 #(\d+) 근거: (.*)$")
+PROSE_SOURCE = re.compile(r" 문서 #(\d+)에는 “(.*?)”라고 기록돼 있어요\.")
 
 
 def read(name: str) -> dict:
@@ -71,6 +72,18 @@ def latency(values: list[float]) -> dict:
 
 
 def emitted_claims(answer: str) -> list[dict]:
+    if PROSE_SOURCE.search(answer):
+        claims = []
+        for paragraph in answer.split("\n\n"):
+            references = list(PROSE_SOURCE.finditer(paragraph))
+            if references:
+                claims.append({
+                    "text": paragraph[:references[0].start()].strip(),
+                    "sources": [{"documentId": int(source[1]), "quote": source[2]}
+                                for source in references],
+                })
+        return claims
+
     claims: list[dict] = []
     for line in answer.splitlines():
         source = SOURCE.fullmatch(line)
