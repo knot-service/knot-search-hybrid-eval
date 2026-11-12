@@ -20,8 +20,9 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
 
     private static final String MEETING_GROUPS = """
             evidence는 회의 ID로 묶여 있다. 같은 날이나 비슷한 시각이라도 회의 ID가 다르면 독립된 기록이다.
-            각 주장에는 그 사실을 기록한 그룹 안에서만 문서와 인용구를 고른다.
-            여러 회의를 비교하면 회의별 주장으로 나누고, 각 회의의 결정·검토·미정 상태를 구분한다.
+            각 주장에는 그 사실을 기록한 그룹의 문서와 인용구를 붙인다.
+            비교의 핵심 차이가 두 회의에 걸쳐 있으면 첫 문장에서 그 차이를 설명하고 두 회의의 출처를 붙인다.
+            회의별 설명에서는 결정·검토·미정 상태를 구분한다.
             질문이 지정한 회의가 확인되지 않으면 다른 그룹으로 대체하지 말고 insufficient로 표시한다.
             sources에는 그룹 ID 대신 해당 문서의 evidenceId를 쓴다.
             """;
