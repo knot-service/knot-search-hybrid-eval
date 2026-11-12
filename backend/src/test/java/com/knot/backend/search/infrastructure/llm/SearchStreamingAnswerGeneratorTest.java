@@ -236,10 +236,12 @@ class SearchStreamingAnswerGeneratorTest {
             assertThat(groups.get(0).path("documents").get(1).path("evidenceId").asString()).isEqualTo("E3");
             assertThat(groups.get(1).path("meetingId").asLong()).isEqualTo(172L);
             assertThat(groups.get(1).path("documents").get(0).path("evidenceId").asString()).isEqualTo("E2");
+            assertThat(groups.get(0).path("documents").get(0).path("content").asString())
+                    .contains("[E1Q1] 도입 여부가 아직 확정되지 않았다.");
             Consumer<String> consumer = call.getArgument(2);
             consumer.accept("""
                     {"claims":[{"text":"첫 회의에서 도입은 미정이었다.","sources":[
-                    {"evidenceId":"E1","quote":"도입 여부가 아직 확정되지 않았다."}]}],"insufficient":false}
+                    {"evidenceId":"E1","quoteId":"E1Q1"}]}],"insufficient":false}
                     """);
             return null;
         }).when(llm).streamStructuredAnswer(eq(scope), any(), any());

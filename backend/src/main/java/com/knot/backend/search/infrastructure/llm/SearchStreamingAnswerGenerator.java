@@ -45,7 +45,7 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
                 scope,
                 question,
                 SearchAnswerPrompt.system(),
-                evidence(documents)
+                evidence(documents, Map.of())
         );
         SearchAgentContext context = new SearchAgentContext(
                 properties,
@@ -76,17 +76,18 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
     ) {
         access.validate(scope);
         boolean grouped = !documents.isEmpty() && documents.stream().allMatch(doc -> doc.meetingId() != null);
+        var sourceIndex = SearchGroundedEvidence.index(documents);
         var messages = messages(
                 scope,
                 question,
                 SearchAnswerPrompt.grounded() + (grouped ? "\n" + MEETING_GROUPS : ""),
-                grouped ? meetingEvidence(documents) : evidence(documents)
+                grouped ? meetingEvidence(documents, sourceIndex) : evidence(documents, sourceIndex)
         );
         new SearchAgentContext(properties, mapper).validate(messages);
         StringBuilder response = new StringBuilder();
         llm.streamStructuredAnswer(scope, messages, response::append);
         access.validate(scope);
-        SearchGroundedAnswer.Verified verified = SearchGroundedAnswer.verify(response.toString(), documents, mapper);
+        SearchGroundedAnswer.Verified verified = SearchGroundedAnswer.verify(response.toString(), sourceIndex, mapper);
         onDelta.accept(verified.render());
         return verified.documentIds();
     }
@@ -122,19 +123,25 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
         );
     }
 
-    private List<Map<String, Object>> meetingEvidence(List<SearchDocumentResult> documents) {
+    private List<Map<String, Object>> meetingEvidence(
+            List<SearchDocumentResult> documents,
+            Map<String, SearchGroundedEvidence> sourceIndex
+    ) {
         return documents.stream()
                 .collect(Collectors.groupingBy(SearchDocumentResult::meetingId, LinkedHashMap::new, Collectors.toList()))
                 .entrySet()
                 .stream()
                 .map(group -> Map.<String, Object>of(
                         "meetingId", group.getKey(),
-                        "documents", evidence(group.getValue())
+                        "documents", evidence(group.getValue(), sourceIndex)
                 ))
                 .toList();
     }
 
-    private List<Map<String, Object>> evidence(List<SearchDocumentResult> documents) {
+    private List<Map<String, Object>> evidence(
+            List<SearchDocumentResult> documents,
+            Map<String, SearchGroundedEvidence> sourceIndex
+    ) {
         return documents.stream()
                 .map(
                         document -> Map.<String, Object>of(
@@ -147,7 +154,9 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
                                 "topic",
                                 document.topic(),
                                 "content",
-                                document.content()
+                                sourceIndex.isEmpty()
+                                        ? document.content()
+                                        : sourceIndex.get("E" + document.documentId()).content()
                         )
                 )
                 .toList();

@@ -1,21 +1,18 @@
 package com.knot.backend.search.infrastructure.llm;
 
-import com.knot.backend.search.application.dto.result.SearchDocumentResult;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 import tools.jackson.databind.ObjectMapper;
 
 record SearchGroundedAnswer(
-        List<Claim> claims,
+        List<ModelClaim> claims,
         boolean insufficient
 ) {
     private static final int MAX_CLAIMS = 6;
-    private static final int MAX_SOURCES = 3;
     private static final int MAX_SOURCES_PER_CLAIM = 2;
 
     static Map<String, Object> responseFormat() {
@@ -23,12 +20,12 @@ record SearchGroundedAnswer(
                 Map.of(
                         "evidenceId",
                         string(),
-                        "quote",
+                        "quoteId",
                         string()
                 ),
                 List.of(
                         "evidenceId",
-                        "quote"
+                        "quoteId"
                 )
         );
         var claim = object(
@@ -118,7 +115,7 @@ record SearchGroundedAnswer(
 
     static Verified verify(
             String json,
-            List<SearchDocumentResult> documents,
+            Map<String, SearchGroundedEvidence> evidence,
             ObjectMapper mapper
     ) {
         SearchGroundedAnswer answer = mapper.reader()
@@ -126,103 +123,52 @@ record SearchGroundedAnswer(
                 .with(tools.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
                 .forType(SearchGroundedAnswer.class)
                 .readValue(json);
-        Map<String, SearchDocumentResult> sources = documents.stream()
-                .collect(
-                        Collectors.toMap(
-                                doc -> "E" + doc.documentId(),
-                                Function.identity()
-                        )
-                );
+        if (answer.claims() == null || answer.claims().size() > MAX_CLAIMS) {
+            return new Verified(List.of(), List.of(), true);
+        }
         List<Claim> valid = new ArrayList<>();
         Set<Long> used = new LinkedHashSet<>();
         boolean incomplete = answer.insufficient();
-        if (answer.claims() == null || answer.claims()
-                .size() > MAX_CLAIMS) {
-            return new Verified(
-                    List.of(),
-                    List.of(),
-                    true
-            );
-        }
-        for (Claim claim : answer.claims()) {
-            Claim checked = verifiedClaim(
-                    claim,
-                    sources
-            );
+        for (ModelClaim claim : answer.claims()) {
+            Claim checked = verifiedClaim(claim, evidence);
             if (checked == null) {
                 incomplete = true;
                 continue;
             }
-            Set<Long> combined = new LinkedHashSet<>(used);
-            checked.sources()
-                    .forEach(
-                            source -> combined.add(
-                                    sources.get(source.evidenceId())
-                                            .documentId()
-                            )
-                    );
-            if (combined.size() > MAX_SOURCES) {
-                incomplete = true;
-                continue;
-            }
-            used = combined;
+            checked.sources().forEach(source -> used.add(source.documentId()));
             valid.add(checked);
         }
-        return new Verified(
-                List.copyOf(valid),
-                List.copyOf(used),
-                incomplete
-        );
+        return new Verified(List.copyOf(valid), List.copyOf(used), incomplete);
     }
 
     private static Claim verifiedClaim(
-            Claim claim,
-            Map<String, SearchDocumentResult> sources
+            ModelClaim claim,
+            Map<String, SearchGroundedEvidence> evidence
     ) {
         if (claim == null || claim.text() == null || claim.text().isBlank()
                 || claim.text().length() > 600 || claim.sources() == null
                 || claim.sources().isEmpty() || claim.sources().size() > MAX_SOURCES_PER_CLAIM) {
             return null;
         }
-        List<Source> verified = new ArrayList<>();
-        for (Source source : claim.sources()) {
-            Source checked = verifiedSource(source, sources);
-            if (checked == null) {
+        Set<Source> verified = new LinkedHashSet<>();
+        for (ModelSource source : claim.sources()) {
+            if (source == null || source.evidenceId() == null || source.quoteId() == null) {
                 return null;
             }
-            verified.add(checked);
+            SearchGroundedEvidence document = evidence.get(source.evidenceId());
+            String quote = document == null ? null : document.quotes().get(source.quoteId());
+            if (quote == null) {
+                return null;
+            }
+            verified.add(new Source(document.documentId(), quote));
         }
         return new Claim(claim.text(), List.copyOf(verified));
     }
 
-    private static Source verifiedSource(
-            Source source,
-            Map<String, SearchDocumentResult> sources
-    ) {
-        if (source == null || source.quote() == null) {
-            return null;
-        }
-        SearchDocumentResult document = sources.get(source.evidenceId());
-        if (document == null) {
-            return null;
-        }
-        String quote = source.quote().strip();
-        if (matchesExcerpt(quote, document)) {
-            return new Source(source.evidenceId(), quote);
-        }
-        String content = document.content();
-        int headerEnd = content == null ? -1 : content.indexOf('\n');
-        if (headerEnd < 0 || !content.startsWith("회의 시각(한국): ")
-                || !quote.startsWith(content.substring(0, headerEnd + 1))) {
-            return null;
-        }
-        String excerptQuote = quote.substring(headerEnd + 1).strip();
-        return matchesExcerpt(excerptQuote, document) ? new Source(source.evidenceId(), excerptQuote) : null;
+    record ModelClaim(String text, List<ModelSource> sources) {
     }
 
-    private static boolean matchesExcerpt(String quote, SearchDocumentResult document) {
-        return quote.length() >= 8 && quote.length() <= 300
-                && document.excerpts().stream().anyMatch(excerpt -> excerpt.contains(quote));
+    record ModelSource(String evidenceId, String quoteId) {
     }
 
     record Claim(
@@ -240,13 +186,12 @@ record SearchGroundedAnswer(
     }
 
     record Source(
-            String evidenceId,
+            long documentId,
             String quote
     ) {
         String render() {
-            String documentNumber = evidenceId.substring(1);
             String excerpt = quote.replaceAll("\\R", " ");
-            return "문서 #" + documentNumber + "에는 “" + excerpt + "”라고 기록돼 있어요.";
+            return "문서 #" + documentId + "에는 “" + excerpt + "”라고 기록돼 있어요.";
         }
     }
 

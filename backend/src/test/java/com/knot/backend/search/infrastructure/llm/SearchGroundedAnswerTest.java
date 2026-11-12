@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.knot.backend.search.application.dto.result.SearchDocumentResult;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
@@ -14,7 +15,7 @@ class SearchGroundedAnswerTest {
             .build();
 
     @Test
-    void keepsClaimsWithExactQuotesAndRejectsWrongDocumentAndStitchedPassages() {
+    void rendersExactQuotesAndRejectsUnknownOrCrossDocumentReferences() {
         var docs = List.of(
                 new SearchDocumentResult(
                         1,
@@ -38,13 +39,13 @@ class SearchGroundedAnswerTest {
                 """
                         {"insufficient":false,"claims":[
                           {"text":"처음 제안했고 다음 주 전환에 합의했다.","sources":[
-                            {"evidenceId":"E1","quote":"자동 배포 전환을 제안했다."},
-                            {"evidenceId":"E2","quote":"다음 주에 전환하기로 합의했다."}]},
-                          {"text":"금요일에 한다.","sources":[{"evidenceId":"E2","quote":"금요일은 보류됐다."}]},
-                          {"text":"전환일은 금요일이다.","sources":[{"evidenceId":"E1","quote":"제안했다. 금요일은 보류됐다."}]}
+                            {"evidenceId":"E1","quoteId":"E1Q1"},
+                            {"evidenceId":"E2","quoteId":"E2Q1"}]},
+                          {"text":"금요일에 한다.","sources":[{"evidenceId":"E2","quoteId":"E1Q2"}]},
+                          {"text":"전환일은 금요일이다.","sources":[{"evidenceId":"E1","quoteId":"E1Q99"}]}
                         ]}
                         """,
-                docs,
+                SearchGroundedEvidence.index(docs),
                 mapper
         );
         assertThat(result.claims()).hasSize(1);
@@ -63,32 +64,50 @@ class SearchGroundedAnswerTest {
     }
 
     @Test
-    void acceptsExactExcerptAfterTheDocumentMeetingTime() {
-        var document = new SearchDocumentResult(
-                2158L,
-                "로그인 유지 시간 논의",
-                "세션",
-                "회의 시각(한국): 2026-10-15 23:59:00 +09:00\n## 결정\n세션 유지 시간은 확정되지 않았다.",
-                List.of("## 결정\n세션 유지 시간은 확정되지 않았다.")
+    void keepsVerifiedClaimsThatNeedFourDistinctDocuments() {
+        var docs = List.of(
+                new SearchDocumentResult(1, "제안", "탐색", "", List.of("날짜별 탐색 구조가 제안되었다.")),
+                new SearchDocumentResult(2, "시각화", "탐색", "", List.of("탐색의 시각화 방식은 아직 정해지지 않았다.")),
+                new SearchDocumentResult(3, "할 일", "탐색", "", List.of("할 일 화면의 구체적 구현 방식은 미정이다.")),
+                new SearchDocumentResult(4, "홈", "탐색", "", List.of("홈 화면의 독립 뷰 제공 여부는 정해지지 않았다."))
         );
         var result = SearchGroundedAnswer.verify(
                 """
                         {"insufficient":false,"claims":[
-                          {"text":"세션 유지 시간은 미확정이다.","sources":[
-                            {"evidenceId":"E2158","quote":"회의 시각(한국): 2026-10-15 23:59:00 +09:00\\n## 결정\\n세션 유지 시간은 확정되지 않았다."}]},
-                          {"text":"시각이 다른 주장","sources":[
-                            {"evidenceId":"E2158","quote":"회의 시각(한국): 2026-10-16 23:59:00 +09:00\\n세션 유지 시간은 확정되지 않았다."}]},
-                          {"text":"원문이 바뀐 주장","sources":[
-                            {"evidenceId":"E2158","quote":"회의 시각(한국): 2026-10-15 23:59:00 +09:00\\n세션 유지 시간은 1시간으로 확정되었다."}]}
+                          {"text":"날짜별 탐색 구조는 제안이었다.","sources":[
+                            {"evidenceId":"E1","quoteId":"E1Q1"}]},
+                          {"text":"탐색의 시각화 방식은 미정이었다.","sources":[
+                            {"evidenceId":"E2","quoteId":"E2Q1"}]},
+                          {"text":"할 일 화면의 구현 방식과 독립 뷰 제공 여부는 미정이었다.","sources":[
+                            {"evidenceId":"E3","quoteId":"E3Q1"},{"evidenceId":"E4","quoteId":"E4Q1"}]}
                         ]}
                         """,
-                List.of(document),
+                SearchGroundedEvidence.index(docs),
                 mapper
         );
-        assertThat(result.claims()).hasSize(1);
-        assertThat(result.documentIds()).containsExactly(2158L);
-        assertThat(result.render()).contains("세션 유지 시간은 확정되지 않았다.")
-                .doesNotContain("회의 시각", "시각이 다른 주장", "원문이 바뀐 주장");
+        assertThat(result.claims()).hasSize(3);
+        assertThat(result.documentIds()).containsExactly(1L, 2L, 3L, 4L);
+        assertThat(result.render()).contains(
+                "할 일 화면의 구현 방식과 독립 뷰 제공 여부는 미정이었다.",
+                "문서 #4에는 “홈 화면의 독립 뷰 제공 여부는 정해지지 않았다.”"
+        );
+        assertThat(result.incomplete()).isFalse();
+    }
+
+    @Test
+    void indexesOnlyContiguousExcerptsAndPreservesMeetingTimeForTheModel() {
+        String longExcerpt = "고객 문의가 반복되어 개선 가능성을 검토했다. ".repeat(20).strip();
+        String decision = "세션 유지 시간은 확정되지 않았다.";
+        String time = "회의 시각(한국): 2026-10-15 23:59:00 +09:00";
+        var document = new SearchDocumentResult(
+                2158, "로그인", "세션", time + "\n" + decision,
+                List.of("## 결정\n" + decision, longExcerpt)
+        );
+        var evidence = SearchGroundedEvidence.index(List.of(document)).get("E2158");
+        assertThat(evidence.content()).startsWith(time).contains("[E2158Q1] " + decision);
+        assertThat(evidence.quotes()).containsEntry("E2158Q1", decision);
+        assertThat(evidence.quotes().values()).allMatch(quote ->
+                quote.length() <= 300 && (decision.contains(quote) || longExcerpt.contains(quote)));
     }
 
     @Test
@@ -96,7 +115,7 @@ class SearchGroundedAnswerTest {
         assertThatThrownBy(
                 () -> SearchGroundedAnswer.verify(
                         "{\"claims\":[],\"insufficient\":true} 검증되지 않은 문장",
-                        List.of(),
+                        Map.of(),
                         mapper
                 )
         ).isInstanceOf(JacksonException.class);
