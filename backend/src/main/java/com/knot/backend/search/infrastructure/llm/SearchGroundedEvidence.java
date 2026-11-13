@@ -26,8 +26,16 @@ record SearchGroundedEvidence(long documentId, String title, String content, Map
         if (body != null && body.startsWith("회의 시각(한국): ")) {
             content.add(body.lines().findFirst().orElseThrow());
         }
-        for (String excerpt : document.excerpts()) {
-            for (String line : excerpt.lines().toList()) {
+        boolean containsSummary = !document.summaryExcerptIndexes().isEmpty();
+        for (int i = 0; i < document.excerpts().size(); i++) {
+            if (containsSummary) {
+                if (document.summaryExcerptIndexes().contains(i)) {
+                    content.add("발췌 유형: 문서 요약");
+                } else {
+                    content.add("발췌 유형: 문서 본문");
+                }
+            }
+            for (String line : document.excerpts().get(i).lines().toList()) {
                 if (line.isBlank() || line.stripLeading().startsWith("#")) {
                     content.add(line);
                     continue;

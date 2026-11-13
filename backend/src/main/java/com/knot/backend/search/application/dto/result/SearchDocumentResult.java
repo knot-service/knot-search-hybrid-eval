@@ -1,6 +1,7 @@
 package com.knot.backend.search.application.dto.result;
 
 import java.util.List;
+import java.util.Set;
 
 public record SearchDocumentResult(
         long documentId,
@@ -8,10 +9,23 @@ public record SearchDocumentResult(
         String topic,
         String content,
         List<String> excerpts,
-        Long meetingId
+        Long meetingId,
+        Set<Integer> summaryExcerptIndexes
 ) {
     public SearchDocumentResult {
         excerpts = List.copyOf(excerpts);
+        summaryExcerptIndexes = Set.copyOf(summaryExcerptIndexes);
+    }
+
+    public SearchDocumentResult(
+            long documentId,
+            String title,
+            String topic,
+            String content,
+            List<String> excerpts,
+            Long meetingId
+    ) {
+        this(documentId, title, topic, content, excerpts, meetingId, Set.of());
     }
 
     public SearchDocumentResult(

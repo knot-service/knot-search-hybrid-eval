@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.knot.backend.search.application.dto.result.SearchDocumentResult;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
@@ -109,6 +110,25 @@ class SearchGroundedAnswerTest {
         assertThat(evidence.quotes()).containsEntry("E2158Q1", decision);
         assertThat(evidence.quotes().values()).allMatch(quote ->
                 quote.length() <= 300 && (decision.contains(quote) || longExcerpt.contains(quote)));
+    }
+
+    @Test
+    void labelsSummaryAndBodyExcerptsWithoutChangingQuoteIdsOrText() {
+        String body = "명세서와 구현이 일치하는지 검토해 달라는 요청이 있었다.";
+        String summary = "명세서와 구현의 일치 여부 확인이 진행 중이다.";
+        var document = new SearchDocumentResult(
+                413, "구현 내용 검토", "", "", List.of(body, summary), null, Set.of(1)
+        );
+
+        var evidence = SearchGroundedEvidence.index(List.of(document)).get("E413");
+
+        assertThat(evidence.content()).containsSubsequence(
+                "발췌 유형: 문서 본문", "[E413Q1] " + body,
+                "발췌 유형: 문서 요약", "[E413Q2] " + summary
+        );
+        assertThat(evidence.quotes()).containsExactlyInAnyOrderEntriesOf(Map.of(
+                "E413Q1", body, "E413Q2", summary
+        ));
     }
 
     @Test

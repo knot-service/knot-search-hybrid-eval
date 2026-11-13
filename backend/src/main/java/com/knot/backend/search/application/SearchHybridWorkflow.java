@@ -349,6 +349,12 @@ public class SearchHybridWorkflow {
         List<String> quotes = evidence.stream()
                 .map(Passage::quote)
                 .toList();
+        var summaryExcerptIndexes = new HashSet<Integer>();
+        for (int i = 0; i < evidence.size(); i++) {
+            if ("summary".equals(evidence.get(i).field())) {
+                summaryExcerptIndexes.add(i);
+            }
+        }
         String text = "회의 시각(한국): " + MEETING_TIME.format(doc.recordingStartedAt()) + "\n" + String.join(
                 "\n\n",
                 quotes
@@ -360,7 +366,8 @@ public class SearchHybridWorkflow {
                         doc.topic(),
                         text,
                         quotes,
-                        meetingId
+                        meetingId,
+                        summaryExcerptIndexes
                 )
         );
     }
