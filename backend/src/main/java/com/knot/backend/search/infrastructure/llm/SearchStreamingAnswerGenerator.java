@@ -75,13 +75,14 @@ public class SearchStreamingAnswerGenerator implements SearchAnswerGenerator {
             Consumer<String> onDelta
     ) {
         access.validate(scope);
-        boolean grouped = !documents.isEmpty() && documents.stream().allMatch(doc -> doc.meetingId() != null);
-        var sourceIndex = SearchGroundedEvidence.index(documents);
+        var scopedDocuments = SearchGroundedDocumentScope.selectDatedDiscussion(question, documents);
+        boolean grouped = !scopedDocuments.isEmpty() && scopedDocuments.stream().allMatch(doc -> doc.meetingId() != null);
+        var sourceIndex = SearchGroundedEvidence.index(scopedDocuments);
         var messages = messages(
                 scope,
                 question,
                 SearchAnswerPrompt.grounded() + (grouped ? "\n" + MEETING_GROUPS : ""),
-                grouped ? meetingEvidence(documents, sourceIndex) : evidence(documents, sourceIndex)
+                grouped ? meetingEvidence(scopedDocuments, sourceIndex) : evidence(scopedDocuments, sourceIndex)
         );
         new SearchAgentContext(properties, mapper).validate(messages);
         StringBuilder response = new StringBuilder();
