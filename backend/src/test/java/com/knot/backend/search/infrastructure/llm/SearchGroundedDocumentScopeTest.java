@@ -53,6 +53,18 @@ class SearchGroundedDocumentScopeTest {
         )).containsExactly(discussion);
     }
 
+    @Test
+    void prefersTheExactTitleOverASeparateMeetingWithTheSameTopic() {
+        var later = new SearchDocumentResult(1, "계정 사용 여부 확인 결과", "계정 사용 여부 확인",
+                "회의 시각(한국): 2026-10-19 15:12:44 +09:00", List.of(), null);
+        var requested = new SearchDocumentResult(2, "계정 사용 여부 확인", "계정 사용 여부 확인",
+                "회의 시각(한국): 2026-10-19 15:12:23 +09:00", List.of(), null);
+
+        assertThat(SearchGroundedDocumentScope.selectDatedDiscussion(
+                "10월 19일 계정 사용 여부 확인 회의에서 실제로 쓰는지 확인됐어?", List.of(later, requested)
+        )).containsExactly(requested);
+    }
+
     private static SearchDocumentResult document(long id, String title, long meetingId) {
         return new SearchDocumentResult(id, title, title, "", List.of(), meetingId);
     }

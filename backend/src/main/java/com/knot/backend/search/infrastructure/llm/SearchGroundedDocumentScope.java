@@ -23,12 +23,15 @@ final class SearchGroundedDocumentScope {
         }
         List<String> words = words(discussion.group(1));
         String phrase = String.join(" ", words.subList(words.size() - 2, words.size()));
-        var titleMatch = unique(documents, document -> {
-            var title = words(document.title());
-            var topic = words(document.topic());
-            return (containsAll(title, words) && String.join(" ", title).contains(phrase))
-                    || (containsAll(topic, words) && String.join(" ", topic).contains(phrase));
-        });
+        var titleMatch = unique(documents, document -> words(document.title()).equals(words));
+        if (titleMatch == documents) {
+            titleMatch = unique(documents, document -> {
+                var title = words(document.title());
+                var topic = words(document.topic());
+                return (containsAll(title, words) && String.join(" ", title).contains(phrase))
+                        || (containsAll(topic, words) && String.join(" ", topic).contains(phrase));
+            });
+        }
         if (titleMatch == documents || titleMatch.getFirst().equals(documents.getFirst())) {
             return titleMatch;
         }
